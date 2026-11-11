@@ -27,6 +27,8 @@ import sys
 import time
 from typing import Any
 
+from harp_ai import DEFAULT_BASE_URL, DEFAULT_MODEL, review_preflight
+
 try:
     import numpy as np
 except ImportError:
@@ -963,9 +965,19 @@ def cli(argv=None):
     ap.add_argument('--report',type=Path,help='Optional JSON validation report')
     ap.add_argument('--verify',action='store_true',help='Only verify an already-placed board')
     ap.add_argument('--direction-rules',type=Path,help='JSON {"components": {"J1": {"side":"right","outward_local":"right"}}}')
-    ap.add_argument('--allow-unverified-footprints',action='store_true',help='Explicitly accept synthetic placeholders for geometric experiments')
-    ap.add_argument('--allow-unresolved-orientation',action='store_true',help='Explicitly accept unknown directions; NOT safe for production')
+    ap.add_argument('--allow-unverified-footprints',action='store_true',help='Legacy override for --strict-preflight, geometry experiments only')
+    ap.add_argument('--allow-unresolved-orientation',action='store_true',help='Legacy override for --strict-preflight, NOT safe for production')
     ap.add_argument('--preflight-only',action='store_true',help='Write/list footprint and orientation issues without placement')
+    ap.add_argument('--strict-preflight', action='store_true',
+                    help='Abort on synthetic or ambiguous facing instead of issuing warnings')
+    ap.add_argument('--ai-preflight', action='store_true',
+                    help='Opt in to an LLM advisory for flagged footprints; never changes geometry')
+    ap.add_argument('--ai-base-url', default=DEFAULT_BASE_URL,
+                    help='IntelCAD AI-router endpoint (HTTPS, host restricted)')
+    ap.add_argument('--ai-model', default=DEFAULT_MODEL,
+                    help='Model for optional advisory, e.g. cc/claude-haiku-5-5')
+    ap.add_argument('--ai-timeout', type=float, default=20.0,
+                    help='LLM request timeout in seconds (network failures always fall back)')
     ap.add_argument('--replace-nonrectangular-outline',action='store_true',help='Explicitly replace an existing curved/polygon board edge with a rectangular one')
     ap.add_argument('--stages-dir',type=Path,help='Save verified intermediate KiCad PCB snapshots and previews')
     ap.add_argument('--snapshot-every',type=int,default=0,help='Write intermediate anneal snapshots every N iterations (requires --stages-dir)')
@@ -989,6 +1001,25 @@ def cli(argv=None):
                       'will_be_replaced_by_rectangle':True}
     audit['existing_copper']={tag:len(children(tree,tag)) for tag in ('segment','arc','via','zone')}
     rule_map={p.name:p.edge_rule for p in ps if p.edge_rule}
+    review_needed = bool(audit['synthetic_footprints'] or audit['unresolved_directions'])
+    audit['review_required'] = review_needed
+    audit['validation_mode'] = 'strict' if args.strict_preflight else 'best_effort'
+    audit['nonblocking_warnings'] = []
+    if audit['synthetic_footprints']:
+        audit['nonblocking_warnings'].append(
+            'Synthetic/placeholder footprints are NOT repaired or verified; geometry-only output. '
+            'Replace against datasheets and verified library footprints before manufacture.')
+    if audit['unresolved_directions']:
+        audit['nonblocking_warnings'].append(
+            'Access-facing orientation cannot be inferred reliably for: '
+            + ', '.join(audit['unresolved_directions'])
+            + '. No outward-facing constraint was applied to these parts; review by hand.')
+    audit['ai_review'] = review_preflight(
+        audit, ps, enabled=args.ai_preflight,
+        base_url=args.ai_base_url, model=args.ai_model, timeout=args.ai_timeout)
+    if args.ai_preflight and audit['ai_review']['status'] not in ('advice_received', 'no_issues'):
+        audit['nonblocking_warnings'].append(
+            'Optional AI review unavailable or unconfigured; continuing with local geometry.')
     if args.preflight_only:
         print(json.dumps(audit,indent=2,ensure_ascii=False))
         if args.report:
@@ -998,10 +1029,10 @@ def cli(argv=None):
     if args.verify:
         result=verify(source,source,args.clearance,args.edge_margin,rule_map)
         print(json.dumps(result,indent=2,ensure_ascii=False));return 0
-    if audit['synthetic_footprints'] and not args.allow_unverified_footprints:
+    if args.strict_preflight and audit['synthetic_footprints'] and not args.allow_unverified_footprints:
         raise ValueError('Synthetic/placeholder footprints detected: '+', '.join(x['ref'] for x in audit['synthetic_footprints'])+
                          '. Replace them with verified land patterns, or use --allow-unverified-footprints for geometry experiments only.')
-    if audit['unresolved_directions'] and not args.allow_unresolved_orientation:
+    if args.strict_preflight and audit['unresolved_directions'] and not args.allow_unresolved_orientation:
         raise ValueError('Ambiguous access direction for: '+', '.join(audit['unresolved_directions'])+
                          '. Provide --direction-rules or explicitly use --allow-unresolved-orientation.')
     if audit['outline']['nonrectangular_or_unsupported'] and not args.replace_nonrectangular_outline:
@@ -1048,6 +1079,10 @@ def cli(argv=None):
     result['proxy_wirelength_weighted_mm']=round(result.pop('wire_proxy'),3)
     result['runtime_seconds']=round(time.perf_counter()-start,2)
     result['footprint_audit']=audit
+    result['output_status']='GEOMETRY_ONLY_REVIEW_REQUIRED'
+    result['manufacturing_ready']=False
+    result['review_required_components']=sorted(set(
+        r['ref'] for r in audit['synthetic_footprints']) | set(audit['unresolved_directions']))
     result['stages']=stages
     result['warning']='Unrouted placement only. KiCad DRC, actual part footprints, opening direction and manufacturing review are required.'
     args.output.parent.mkdir(parents=True,exist_ok=True)

@@ -23,9 +23,9 @@ jobs:
       - name: Install package and test dependencies
         run: python -m pip install -e '.[dev,preview]'
       - name: Syntax check
-        run: python -m compileall -q harp_pcb.py tests
+        run: python -m compileall -q harp_pcb.py harp_ai.py tests
       - name: Lint
-        run: python -m ruff check harp_pcb.py tests
+        run: python -m ruff check harp_pcb.py harp_ai.py tests
       - name: Unit and integration tests
         run: python -m pytest -q
       - name: Validate notebook JSON and Python cells

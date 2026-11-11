@@ -167,7 +167,7 @@ def test_placed_input_is_fully_replaced(tmp_path):
 def test_orientation_missing_is_blocked(tmp_path):
     path=tmp_path/'access.kicad_pcb';out=tmp_path/'out.kicad_pcb'
     path.write_text(access_board())
-    proc=subprocess.run([sys.executable,'-m','harp_pcb',str(path),'-o',str(out),'--iterations','50'],
+    proc=subprocess.run([sys.executable,'-m','harp_pcb',str(path),'-o',str(out),'--iterations','50','--strict-preflight'],
                         capture_output=True,text=True,timeout=90)
     assert proc.returncode!=0 and 'Ambiguous access direction' in proc.stderr
     assert not out.exists()
@@ -216,7 +216,7 @@ def test_explicit_facing_on_four_edges(tmp_path,side,local,angle):
 def test_synthetic_footprint_halts_and_preflight_can_report(tmp_path):
     src=board().replace('Test:Sample_0','SYNTH_FAKE_LAND_PATTERN',1)
     path=tmp_path/'in.kicad_pcb';out=tmp_path/'out.kicad_pcb';path.write_text(src)
-    proc=subprocess.run([sys.executable,'-m','harp_pcb',str(path),'-o',str(out)],
+    proc=subprocess.run([sys.executable,'-m','harp_pcb',str(path),'-o',str(out),'--strict-preflight'],
                         capture_output=True,text=True,timeout=90)
     assert proc.returncode!=0 and 'Synthetic/placeholder' in proc.stderr
     assert not out.exists()
@@ -261,4 +261,5 @@ def test_notebook_code_is_syntax_valid_and_has_no_secrets():
     assert 'files.upload()' in script and 'files.download(' in script
     assert 'getpass(' in script
     assert 'USE_LLM_REPORT = False' in script
-    assert 'ALLOW_UNVERIFIED_FOOTPRINTS = False' in script
+    assert 'STRICT_PREFLIGHT = False' in script
+    assert 'USE_LLM_PREFLIGHT = True' in script

@@ -16,8 +16,8 @@ jobs:
         run: python -m pip install -e '.[dev,preview]'
       - name: Validate code
         run: |
-          python -m compileall -q harp_pcb.py tests
-          python -m ruff check harp_pcb.py tests
+          python -m compileall -q harp_pcb.py harp_ai.py tests
+          python -m ruff check harp_pcb.py harp_ai.py tests
           python -m pytest -q
       - name: Build wheel and source distribution
         run: python -m build

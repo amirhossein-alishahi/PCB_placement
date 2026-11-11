@@ -1,11 +1,11 @@
-# HARP-PCB — KiCad auto-placement prototype (v0.2)
+# HARP-PCB — KiCad auto-placement prototype (v0.3)
 
 > **Geometric placement research tool, not a production board designer.**
 > The engine does **not** route traces, perform formal KiCad DRC, determine genuine footprints from part numbers, or guarantee that arbitrary mechanical/electrical requirements are met.
 
 HARP-PCB reads an **unrouted** KiCad `.kicad_pcb` containing pads/net assignments; footprints may all overlap at `(0,0)` **or already have arbitrary, even wrong, positions and rotations**. It discards the existing placement, builds a new **rectangular** board outline, legalizes bounding boxes, then runs a pin-weighted local optimization. Original pad geometry, footprint content, UUIDs, and board nets are verified unchanged.
 
-**Supports:** rectilinear board auto-sizing; existing overlapping or nonzero starting coordinates; explicit connector/outward-face constraints and a limited `PCB Edge` marker heuristic; stage-by-stage KiCad and PNG snapshots; synthetic footprint warnings and safety gate; strict validation after every saved snapshot.
+**Supports:** rectilinear board auto-sizing; existing overlapping or nonzero starting coordinates; explicit connector/outward-face constraints and a limited `PCB Edge` marker heuristic; stage-by-stage KiCad and PNG snapshots; non-blocking synthetic footprint and ambiguous opening-direction warnings, optional AI preflight advice, and geometry validation after every saved snapshot.
 
 **Does not support generically:** non-rectangular/cutout-aware placement, arbitrary part-specific placement rules, 3D mechanical access verification, locked mounting holes, previously routed tracks/vias, or copper zones. Some footprint shapes and both PCB sides may need a KiCad-level mechanical audit; bounding boxes are approximations. A complex outline is rejected unless explicitly replaced. Existing routes, vias or zones are rejected to avoid corrupting an existing design.
 
@@ -15,7 +15,7 @@ HARP-PCB reads an **unrouted** KiCad `.kicad_pcb` containing pads/net assignment
 
 Run the notebook in order. It installs this repository, accepts one `.kicad_pcb`, shows a **preflight audit**, permits reference-indexed edge rules, then generates `placed.kicad_pcb`, a preview image, JSON report, and optionally a `stages/` folder with inspected KiCad checkpoint boards and previews. A drop-down allows viewing the stages.
 
-**No API key is required.** The optional `https://ai-router.intelcad.ai/v1` call using `cc/claude-haiku-5-5` or `cc/claude-opus-5-5` only summarizes aggregate report statistics, never edits or validates geometry. It is off by default, and key entry is masked.
+**No API key is required.** With `USE_LLM_PREFLIGHT = True` and a key entered in the masked prompt, the optional `https://ai-router.intelcad.ai/v1` request asks `cc/claude-haiku-5-5` or `cc/claude-opus-5-5` to diagnose flagged issues and suggest **unverified** library footprint candidates. Only flagged reference/value/footprint identifiers and pad counts are shared; no raw PCB file, routing, nets, or pad positions. Failed requests fall back locally, without blocking placement. AI recommendations are **never applied automatically** because changing land patterns safely requires datasheet and pad-map verification. Aggregate report explanation is also optional.
 
 ## Local installation and quick start
 
@@ -27,9 +27,18 @@ python -m harp_pcb your_board.kicad_pcb -o placed.kicad_pcb \
   --stages-dir stages --snapshot-every 1000
 ```
 
-If the input contains fabricated `SYNTH_...` land patterns or embedded `SYNTHETIC - NOT A REAL LAND PATTERN` text, the software **blocks normal placement**. You must replace the placeholder with an actual, verified land pattern. To intentionally run a **non-manufacturing geometry experiment**, use `--allow-unverified-footprints`. This **does not fix** fake pad locations or remove the warning text.
+**Best-effort default:** Fabricated `SYNTH_...` land patterns, embedded `SYNTHETIC - NOT A REAL LAND PATTERN` text and ambiguous USB/SD/switch opening directions produce **review warnings** but do not block a geometry-only PCB output. They are **not fixed**; the source footprint stays intact. `--strict-preflight` restores rejection; legacy `--allow-unverified-footprints`/`--allow-unresolved-orientation` override the respective check in strict mode. Crucial: unresolved openings are not asserted to face the board edge.
 
-The tool also blocks **ambiguous access-facing** components (USB/SD-side access/slide switches) unless given a direction rule. `--allow-unresolved-orientation` explicitly disables this safety gate for experiments, but cannot guarantee functionality.
+To request optional AI diagnosis and get a warning-preserving report:
+
+```bash
+# set the secret ONLY in an environment variable (never put it in Git)
+export INTELCAD_API_KEY='your-private-key'
+python -m harp_pcb board.kicad_pcb -o placed.kicad_pcb \
+  --ai-preflight --ai-model cc/claude-haiku-5-5 --report report.json
+```
+
+The model's recommendations are **advisory and unverified**; do not copy a guessed footprint without checking datasheets, pad mapping, pitch and mechanical clearances. Without a key or if the API fails, local fallback continues and the JSON records `no_api_key_fallback` or `api_unavailable_fallback`. The API host is restricted to `https://ai-router.intelcad.ai`. API errors are deliberately sanitized so the token is not printed. The PCB output always reports `manufacturing_ready: false`.
 
 ### Mechanical direction constraints
 
@@ -75,7 +84,7 @@ Input with `segment`, `arc`, `via`, or `zone` is refused because moving footprin
 
 ## Quality gates
 
-`pytest` exercises arbitrary pre-placed footprint coordinates, no-overlap legalization, cardinal side + rotation for all four external faces, marker inference, synthetic refusal, ambiguous direction refusal, nonrectangular safety, source integrity, intermediate stages, and Colab notebook syntax. GitHub Actions runs Python 3.10, 3.12, 3.13, Ruff, pytest and package build; a tagged `v*` push triggers a GitHub Release workflow. GitHub Actions success and branch policies must be separately confirmed in GitHub.
+`pytest` exercises arbitrary pre-placed coordinates, overlap legalization, cardinal direction constraints, marker inference, best-effort synthetic/ambiguous continuation, strict-mode rejection, mocked AI success/timeout/invalid response, secret redaction, unsupported outline safety, source integrity, stages, and Colab notebook syntax. GitHub Actions runs Python 3.10, 3.12, 3.13, Ruff, pytest and package build; a tagged `v*` push triggers a GitHub Release workflow. GitHub Actions success and branch policies must be separately confirmed in GitHub.
 
 ```bash
 python -m pip install -e '.[dev,preview]'

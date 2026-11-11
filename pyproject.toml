@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "harp-pcb-placement"
-version = "0.2.0"
-description = "KiCad PCB placement prototype with edge direction rules and stage snapshots"
+version = "0.3.0"
+description = "KiCad PCB placement prototype with best-effort AI-assisted footprint preflight, edge rules and stage snapshots"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24"]
@@ -22,10 +22,10 @@ dev = ["pytest>=8", "shapely>=2.0", "ruff>=0.8,<1", "build>=1.2"]
 harp-pcb = "harp_pcb:cli"
 
 [tool.hatch.build.targets.wheel]
-only-include = ["harp_pcb.py"]
+only-include = ["harp_pcb.py", "harp_ai.py"]
 
 [tool.hatch.build.targets.sdist]
-include = ["harp_pcb.py", "pyproject.toml", "README.md"]
+include = ["harp_pcb.py", "harp_ai.py", "pyproject.toml", "README.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
