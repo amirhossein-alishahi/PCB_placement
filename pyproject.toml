@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "harp-pcb-placement"
-version = "0.3.0"
-description = "KiCad PCB placement prototype with best-effort AI-assisted footprint preflight, edge rules and stage snapshots"
+version = "0.4.0"
+description = "KiCad PCB placement with functional role priors, explicit RF footprint spacings, stages and best-effort preflight"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24"]

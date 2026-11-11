@@ -356,6 +356,12 @@ class Part:
     y: float = 0.0
     angle: int = 0
     edge_rule: EdgeRule | None = None
+    # Functional hints are soft priors, not mechanical or electrical proof.
+    role: str = 'general'
+    role_evidence: str = 'default'
+    rf_keepout_mm: float = 0.0
+    rf_against: str = 'noisy'
+    rf_references: tuple[str, ...] = ()
 
     @property
     def area(self):
@@ -385,6 +391,157 @@ class Part:
         if a is None: a=self.angle
         px,py=rot_xy(pad.x,pad.y,a)
         return x+px,y+py
+
+
+# Soft functional priors are intentionally distinct from the explicit hard
+# antenna spacing rules below. No fixed 3/5/15 mm is assumed to be safe.
+ROLES = {'io', 'processor', 'core', 'antenna', 'noisy', 'general'}
+PROCESSOR_RE = re.compile(
+    r'stm32|stm8|atmega|attiny|esp32|esp8266|rp2040|rp2350|nrf(?:5[0-9]|91)|'
+    r'samd|same5|samd5|pic(?:16|18|24|32)|mcu|microcontroller|cortex.?m|'
+    r'imx|raspberry.?pi.?pico', re.I)
+ANTENNA_RE = re.compile(r'antenna|chip.?ant|pcb.?ant', re.I)
+NOISE_RE = re.compile(r'dc.?dc|dcdc|buck(?:.?converter)?|boost(?:.?converter)?|'
+                      r'switching.?regulator|switch.?mode|smps|oscillator', re.I)
+
+
+def part_value(part: Part) -> str:
+    return next((str(prop[2]) for prop in children(part.node, 'property')
+                 if len(prop)>2 and prop[1]=='Value'), '')
+
+
+def infer_role(part: Part) -> tuple[str, str]:
+    value = part_value(part)
+    footprint = part.footprint
+    if ANTENNA_RE.search(footprint) or ANTENNA_RE.search(value) or re.match(r'^(ANT|AE)\d+$',part.name,re.I):
+        return 'antenna', 'footprint/value/reference-name heuristic'
+    if part.is_connector:
+        return 'io', 'connector/reference-name heuristic'
+    if PROCESSOR_RE.search(value):
+        return 'processor', 'recognizable processor part number/value'
+    if NOISE_RE.search(value):
+        return 'noisy', 'switching/oscillator part number/value heuristic'
+    if part.name.upper().startswith('U') and len(part.pads)>=12:
+        return 'core', 'multi-pin integrated circuit heuristic'
+    return 'general', 'no applicable signal'
+
+
+def apply_placement_guidance(parts: list[Part], config=None) -> dict:
+    """Attach *hints* and user-authored hard RF spacings to placement parts.
+
+    The role inference does not assert datasheet correctness. A hard antenna
+    keepout exists only if the user supplies distance_mm in this config.
+    """
+    config = config or {}
+    if not isinstance(config,dict) or set(config)-{'components','antenna_keepouts'}:
+        raise ValueError('Placement rules need an object with components and/or antenna_keepouts')
+    overrides = config.get('components', {})
+    rf_rules = config.get('antenna_keepouts', {})
+    if not isinstance(overrides,dict) or not isinstance(rf_rules,dict):
+        raise ValueError('components and antenna_keepouts must both be objects')
+    known = {p.name for p in parts}
+    unknown = (set(overrides)|set(rf_rules))-known
+    if unknown:
+        raise ValueError(f'Unknown component references in placement rules: {sorted(unknown)}')
+    for p in parts:
+        role,evidence = infer_role(p)
+        rule = overrides.get(p.name, {})
+        if not isinstance(rule,dict) or set(rule)-{'role'}:
+            raise ValueError(f'{p.name}: component placement rule must contain only role')
+        if rule:
+            role = str(rule['role']).lower()
+            evidence = 'explicit user role'
+        if role not in ROLES:
+            raise ValueError(f'{p.name}: invalid role {role!r}; expected {sorted(ROLES)}')
+        p.role,p.role_evidence = role,evidence
+        p.rf_keepout_mm=0.0;p.rf_against='noisy';p.rf_references=()
+    for ref,rule in rf_rules.items():
+        p=next(p for p in parts if p.name==ref)
+        if p.role!='antenna':
+            raise ValueError(f'{ref}: hard antenna keepout requires role=antenna')
+        if not isinstance(rule,dict) or set(rule)-{'distance_mm','against','references'}:
+            raise ValueError(f'{ref}: antenna keepout has unsupported fields')
+        distance = rule.get('distance_mm')
+        if isinstance(distance,bool) or not isinstance(distance,(int,float)) or not math.isfinite(distance) or distance<0 or distance>100:
+            raise ValueError(f'{ref}: distance_mm must be a finite number between 0 and 100')
+        against = str(rule.get('against','noisy')).lower()
+        refs = rule.get('references',[])
+        if against not in ('noisy','all','listed') or not isinstance(refs,list) or any(not isinstance(x,str) for x in refs):
+            raise ValueError(f'{ref}: against must be noisy/all/listed and references a list')
+        if set(refs)-known or ref in refs:
+            raise ValueError(f'{ref}: references must name other existing footprints')
+        if against=='listed' and not refs and distance>0:
+            raise ValueError(f'{ref}: listed antenna keepout needs references')
+        p.rf_keepout_mm=float(distance)
+        p.rf_against=against
+        p.rf_references=tuple(dict.fromkeys(refs))
+    return {'roles': {p.name:{'role':p.role,'evidence':p.role_evidence} for p in parts},
+            'hard_antenna_keepouts': {p.name:{'distance_mm':p.rf_keepout_mm,
+                                            'against':p.rf_against,'references':list(p.rf_references)}
+                                       for p in parts if p.rf_keepout_mm>0},
+            'rf_review_needed': [p.name for p in parts if p.role=='antenna' and not p.rf_keepout_mm],
+            'automatic_roles_are_soft_only': True,
+            'antenna_note': 'Automatically inferred RF hints are NOT copper/trace keepouts or datasheet guarantees.'}
+
+
+def bbox_gap(a,b):
+    dx=max(a[0]-b[2],b[0]-a[2],0.0)
+    dy=max(a[1]-b[3],b[1]-a[3],0.0)
+    return math.hypot(dx,dy)
+
+
+def required_rf_clearance(a: Part,b: Part) -> float:
+    """Minimum *footprint envelope* distance from verified user input only."""
+    def one_way(antenna, other):
+        if antenna.role!='antenna' or antenna.rf_keepout_mm<=0:
+            return 0.0
+        match = (antenna.rf_against=='all' or
+                 (antenna.rf_against=='noisy' and other.role in ('noisy','processor')) or
+                 (antenna.rf_against=='listed' and other.name in antenna.rf_references) or
+                 other.name in antenna.rf_references)
+        return antenna.rf_keepout_mm if match else 0.0
+    return max(one_way(a,b),one_way(b,a))
+
+
+def role_prior(part: Part,x,y,angle,W,H) -> float:
+    b=part.bbox(x,y,angle)
+    edge_distance=max(0.0,min(b[0],b[1],W-b[2],H-b[3]))
+    central_distance=math.hypot((b[0]+b[2])/2-W/2,(b[1]+b[3])/2-H/2)
+    return {'io':0.42*edge_distance,'processor':0.72*central_distance,
+            'core':0.13*central_distance,'antenna':0.58*edge_distance,
+            'noisy':0.0,'general':0.0}[part.role]
+
+
+def soft_antenna_pair(a: Part,box_a,b: Part,box_b) -> float:
+    # Heuristic spacing for antenna vs processors / switching noise sources.
+    # This is NOT a validated minimum RF spacing and does not affect legality.
+    if (a.role=='antenna' and b.role in ('processor','noisy')) or \
+       (b.role=='antenna' and a.role in ('processor','noisy')):
+        return 2.4*max(0.0,5.0-bbox_gap(box_a,box_b))
+    return 0.0
+
+
+def role_candidate_cost(parts,idx,x,y,angle,W,H,active=None):
+    p=parts[idx];b=p.bbox(x,y,angle)
+    cost=role_prior(p,x,y,angle,W,H)
+    if p.role in ('antenna','noisy','processor'):
+        active=range(len(parts)) if active is None else active
+        for j in active:
+            if j!=idx:
+                q=parts[j]
+                if q.role in ('antenna','noisy','processor'):
+                    cost+=soft_antenna_pair(p,b,q,q.bbox())
+    return cost
+
+
+def total_role_cost(parts,W,H,origin_x=0.0,origin_y=0.0):
+    cost=sum(role_prior(p,p.x-origin_x,p.y-origin_y,p.angle,W,H) for p in parts)
+    for i,p in enumerate(parts):
+        if p.role!='antenna':continue
+        for j,q in enumerate(parts):
+            if i!=j and q.role in ('noisy','processor'):
+                cost+=soft_antenna_pair(p,p.bbox(),q,q.bbox())
+    return cost
 
 
 def shape_bounds(node):
@@ -551,7 +708,13 @@ def wire_sum(edges,parts,changes=None):
 def legal_candidate(parts,idx,x,y,angle,placed,W,H,clearance,margin):
     b=parts[idx].bbox(x,y,angle)
     if not valid_envelope(parts[idx],x,y,angle,W,H,margin):return False
-    return all(not rects_intersect(b,parts[j].bbox(),clearance) for j in placed if j!=idx)
+    for j in placed:
+        if j==idx: continue
+        q=parts[j];other=q.bbox()
+        if rects_intersect(b,other,clearance): return False
+        need=required_rf_clearance(parts[idx],q)
+        if need and bbox_gap(b,other)<need-1e-7: return False
+    return True
 
 
 def greedy_place(parts,edges,W,H,clearance,margin,rng):
@@ -571,6 +734,7 @@ def greedy_place(parts,edges,W,H,clearance,margin,rng):
                 continue
             score=sum(wire_between(e,parts,{i:(x,y,a)}) for e in touch[i]
                       if (e.i if e.j==i else e.j) in placed)
+            score += role_candidate_cost(parts,i,x,y,a,W,H,placed)
             score += 0.002*math.hypot(x-W/2,y-H/2)
             if best is None or score < best[0]:best=(score,x,y,a)
         if best is None:
@@ -579,7 +743,7 @@ def greedy_place(parts,edges,W,H,clearance,margin,rng):
         placed.add(i)
     free=[i for i in range(n) if i not in placed]
     if free:
-        root=max(free,key=lambda i:(parts[i].area,len(parts[i].pads)))
+        root=max(free,key=lambda i:(int(parts[i].role=='processor'), int(parts[i].role=='core'),parts[i].area,len(parts[i].pads)))
         p=parts[root]
         p.angle=90 if (p.outline[3]-p.outline[1]) > 1.25*(p.outline[2]-p.outline[0]) else 0
         o=p.offsets();p.x=W/2-(o[0]+o[2])/2;p.y=H/2-(o[1]+o[3])/2
@@ -636,11 +800,10 @@ def greedy_place(parts,edges,W,H,clearance,margin,rng):
                 if not legal_candidate(parts,i,x,y,angle,placed,W,H,clearance,margin):continue
                 cost=sum(wire_between(e,parts,{i:(x,y,angle)}) for e in touch[i]
                          if (e.i if e.j==i else e.j) in placed)
-                # Soft non-electrical placement preferences; connector near edge.
-                b=(x+o[0],y+o[1],x+o[2],y+o[3])
-                if p.is_connector:
-                    cost+=0.035*min(b[0],b[1],W-b[2],H-b[3])
-                cost+=0.001*((cx-W/2)**2+(cy-H/2)**2)**0.5
+                # Functional role priors: I/O near an edge, processors near
+                # center, antennas away from known noise candidates. Still soft.
+                cost+=role_candidate_cost(parts,i,x,y,angle,W,H,placed)
+                cost+=0.001*math.hypot(cx-W/2,cy-H/2)
                 # Tight designs: prefer locations adjacent to existing bbox union.
                 if best is None or cost<best[0]:best=(cost,x,y,angle)
         if best is None:return False
@@ -690,13 +853,9 @@ def optimize_local(parts,edges,W,H,clearance,margin,iterations,seed,checkpoint=N
         if not legal_candidate(parts,idx,nx,ny,na,(k for k in range(n) if k!=idx),W,H,clearance,margin):continue
         current=sum(wire_between(e,parts) for e in touch[idx]);
         new=sum(wire_between(e,parts,{idx:(nx,ny,na)}) for e in touch[idx]);
-        # Soft aesthetic penalty, tiny compared with electrical terms.
-        currect=p.bbox();newrect=p.bbox(nx,ny,na)
-        center_pen=lambda b:0.001*math.hypot((b[0]+b[2])/2-W/2,(b[1]+b[3])/2-H/2)
-        if p.is_connector:
-            edge_pen=lambda b:0.035*min(b[0],b[1],W-b[2],H-b[3])
-            current+=edge_pen(currect);new+=edge_pen(newrect)
-        current+=center_pen(currect);new+=center_pen(newrect)
+        # Include pairwise RF soft separation for *either* endpoint moving.
+        current+=role_candidate_cost(parts,idx,x,y,a,W,H)
+        new+=role_candidate_cost(parts,idx,nx,ny,na,W,H)
         if idx==big: new+=0.02*math.hypot(nx-x,ny-y)
         temp=1.0*(1-step/iterations)**1.3+0.007
         if new<=current or rng.random()<math.exp(min(0.0,(current-new)/temp)):
@@ -728,7 +887,8 @@ def place(parts,edges,clearance=0.65,margin=2.0,seed=42,iterations=8000,
         for trial in range(2):
             rr=random.Random(seed+growth*1009+trial*8191)
             if greedy_place(parts,edges,W,H,clearance,margin,rr):
-                solutions.append((wire_sum(edges,parts),[(p.x,p.y,p.angle) for p in parts]))
+                solutions.append((wire_sum(edges,parts)+total_role_cost(parts,W,H),
+                                  [(p.x,p.y,p.angle) for p in parts]))
         if solutions:
             _,locations=min(solutions,key=lambda s:s[0])
             for p,(x,y,a) in zip(parts,locations):p.x,p.y,p.angle=x,y,a
@@ -850,7 +1010,8 @@ def outline_rect(tree):
     return bb if actual==expected else None
 
 
-def verify(source_text, output_text,clearance=0.65,margin=2.0,direction_rules=None):
+def verify(source_text, output_text,clearance=0.65,margin=2.0,direction_rules=None,
+           placement_rules=None):
     old=parse(source_text);new=parse(output_text)
     if old[0]!='kicad_pcb' or new[0]!='kicad_pcb':raise AssertionError('Not KiCad PCB')
     if pad_signatures(old)!=pad_signatures(new):
@@ -883,6 +1044,7 @@ def verify(source_text, output_text,clearance=0.65,margin=2.0,direction_rules=No
             if abs(((olda+delta-newa+180)%360)-180)>1e-5:
                 raise AssertionError(f'Property {oldprop[1]} of {ref} rotated incorrectly')
     ps=decode_parts(new)
+    guidance=apply_placement_guidance(ps,placement_rules)
     for p in ps:
         a=child(p.node,'at')
         p.x,p.y=fnum(a[1]),fnum(a[2]);p.angle=int(round(fnum(a[3]))) if len(a)>3 else 0
@@ -907,11 +1069,12 @@ def verify(source_text, output_text,clearance=0.65,margin=2.0,direction_rules=No
         A=a.bbox()
         for b in ps[i+1:]:
             B=b.bbox()
-            dx=max(A[0]-B[2],B[0]-A[2],0)
-            dy=max(A[1]-B[3],B[1]-A[3],0)
-            d=math.hypot(dx,dy)
+            d=bbox_gap(A,B)
             min_gap=min(min_gap,d)
             if rects_intersect(A,B,clearance-0.0003):hits.append((a.name,b.name,d))
+            needed=required_rf_clearance(a,b)
+            if needed and d<needed-0.0003:
+                hits.append((a.name,b.name,d,f'RF keepout requires {needed} mm'))
     if hits:raise AssertionError(f'Overlaps or clearance violations: {hits[:10]}')
     at=[(p.name,p.x,p.y,p.angle) for p in ps]
     return {'footprints':len(ps),'nets':len(children(new,'net')),'pads':sum(len(p.pads) for p in ps),
@@ -922,7 +1085,8 @@ def verify(source_text, output_text,clearance=0.65,margin=2.0,direction_rules=No
             'synthetic_footprints':sorted(p.name for p in ps if p.footprint.startswith('SYNTH_')),
             'pads_and_nets_unchanged':True,'perimeter_and_clearance_pass':True,
             'unique_placements':len(set((round(x,3),round(y,3)) for _,x,y,_ in at)),
-            'validated_outward_facing': sorted(direction_rules or {})}
+            'validated_outward_facing': sorted(direction_rules or {}),
+            'validated_rf_keepouts':sorted(guidance['hard_antenna_keepouts'])}
 
 
 def preview(parts, report, out):
@@ -936,7 +1100,10 @@ def preview(parts, report, out):
     for p in parts:
         b=p.bbox();
         name=p.name
-        if p.is_connector:col='#ffc88a'
+        if p.role=='antenna':col='#dbb4f6'
+        elif p.role=='io':col='#ffc88a'
+        elif p.role=='processor':col='#8ab4fa'
+        elif p.role=='noisy':col='#f9bba8'
         elif len(p.pads)>=20:col='#a7b9f7'
         elif not p.has_courtyard:col='#f0a3bf'
         else: col='#b5d4de'
@@ -964,7 +1131,9 @@ def cli(argv=None):
     ap.add_argument('--preview',type=Path,help='Optional PNG output')
     ap.add_argument('--report',type=Path,help='Optional JSON validation report')
     ap.add_argument('--verify',action='store_true',help='Only verify an already-placed board')
-    ap.add_argument('--direction-rules',type=Path,help='JSON {"components": {"J1": {"side":"right","outward_local":"right"}}}')
+    ap.add_argument('--direction-rules',type=Path,help='Explicit mechanical opening direction JSON')
+    ap.add_argument('--placement-rules',type=Path,
+                    help='JSON with optional component functional roles and hard antenna footprint spacings')
     ap.add_argument('--allow-unverified-footprints',action='store_true',help='Legacy override for --strict-preflight, geometry experiments only')
     ap.add_argument('--allow-unresolved-orientation',action='store_true',help='Legacy override for --strict-preflight, NOT safe for production')
     ap.add_argument('--preflight-only',action='store_true',help='Write/list footprint and orientation issues without placement')
@@ -992,6 +1161,11 @@ def cli(argv=None):
     ps=decode_parts(tree)
     rules_data=json.loads(args.direction_rules.read_text('utf-8')) if args.direction_rules else {}
     audit=apply_direction_rules(ps,rules_data)
+    placement_data=json.loads(args.placement_rules.read_text('utf-8')) if args.placement_rules else {}
+    guidance=apply_placement_guidance(ps,placement_data)
+    audit['functional_placement']=guidance
+    if guidance['rf_review_needed']:
+        audit['nonverified_rf_refs']=guidance['rf_review_needed']
     edge_nodes=[g for g in tree if isinstance(g,list) and g and g[0].startswith('gr_')
                 and get(g,'layer')=='Edge.Cuts']
     straight_rectangle = outline_rect(tree) is not None
@@ -1001,7 +1175,8 @@ def cli(argv=None):
                       'will_be_replaced_by_rectangle':True}
     audit['existing_copper']={tag:len(children(tree,tag)) for tag in ('segment','arc','via','zone')}
     rule_map={p.name:p.edge_rule for p in ps if p.edge_rule}
-    review_needed = bool(audit['synthetic_footprints'] or audit['unresolved_directions'])
+    review_needed = bool(audit['synthetic_footprints'] or audit['unresolved_directions']
+                         or guidance['rf_review_needed'])
     audit['review_required'] = review_needed
     audit['validation_mode'] = 'strict' if args.strict_preflight else 'best_effort'
     audit['nonblocking_warnings'] = []
@@ -1009,6 +1184,11 @@ def cli(argv=None):
         audit['nonblocking_warnings'].append(
             'Synthetic/placeholder footprints are NOT repaired or verified; geometry-only output. '
             'Replace against datasheets and verified library footprints before manufacture.')
+    if guidance['rf_review_needed']:
+        audit['nonblocking_warnings'].append(
+            'Antenna footprint detected without a datasheet-backed hard keepout for: '
+            + ', '.join(guidance['rf_review_needed'])
+            + '. Edge preference and RF separation are only heuristic; copper and ground-plane keepouts are NOT enforced.')
     if audit['unresolved_directions']:
         audit['nonblocking_warnings'].append(
             'Access-facing orientation cannot be inferred reliably for: '
@@ -1057,7 +1237,7 @@ def cli(argv=None):
         basename=f'{idx:02d}_{name}'
         fp=args.stages_dir/(basename+'.kicad_pcb')
         snap=edit_board(source,components,W,H,0.0,0.0)
-        check=verify(source,snap,args.clearance,args.edge_margin,rule_map)
+        check=verify(source,snap,args.clearance,args.edge_margin,rule_map,placement_data)
         fp.write_text(snap,encoding='utf-8')
         pic=args.stages_dir/(basename+'.png')
         preview(components,{'origin_x':0.0,'origin_y':0.0,'width':W,'height':H},pic)
@@ -1067,7 +1247,7 @@ def cli(argv=None):
                  checkpoint=save_checkpoint if args.stages_dir else None,
                  checkpoint_interval=args.snapshot_every)
     output=edit_board(source,ps,result['width'],result['height'],result['origin_x'],result['origin_y'])
-    checks=verify(source,output,args.clearance,args.edge_margin,rule_map)
+    checks=verify(source,output,args.clearance,args.edge_margin,rule_map,placement_data)
     if args.stages_dir:
         last=args.stages_dir/(f'{len(stages)+1:02d}_final.kicad_pcb')
         last.write_text(output,encoding='utf-8')
@@ -1079,10 +1259,24 @@ def cli(argv=None):
     result['proxy_wirelength_weighted_mm']=round(result.pop('wire_proxy'),3)
     result['runtime_seconds']=round(time.perf_counter()-start,2)
     result['footprint_audit']=audit
+    result['functional_placement']=guidance
+    result['role_soft_cost_final']=round(total_role_cost(ps,result['width'],result['height'],
+                                                         result['origin_x'],result['origin_y']),3)
+    result['role_placement']={p.name:{'role':p.role,
+        'edge_distance_mm':round(max(0.0,min(p.bbox()[0]-result['origin_x'],
+              p.bbox()[1]-result['origin_y'],
+              result['origin_x']+result['width']-p.bbox()[2],
+              result['origin_y']+result['height']-p.bbox()[3])),3),
+        'center_distance_mm':round(math.hypot((p.bbox()[0]+p.bbox()[2])/2-
+              (result['origin_x']+result['width']/2),
+              (p.bbox()[1]+p.bbox()[3])/2-
+              (result['origin_y']+result['height']/2)),3)}
+              for p in ps if p.role!='general'}
     result['output_status']='GEOMETRY_ONLY_REVIEW_REQUIRED'
     result['manufacturing_ready']=False
     result['review_required_components']=sorted(set(
-        r['ref'] for r in audit['synthetic_footprints']) | set(audit['unresolved_directions']))
+        r['ref'] for r in audit['synthetic_footprints']) | set(audit['unresolved_directions'])
+        | set(guidance['rf_review_needed']))
     result['stages']=stages
     result['warning']='Unrouted placement only. KiCad DRC, actual part footprints, opening direction and manufacturing review are required.'
     args.output.parent.mkdir(parents=True,exist_ok=True)

@@ -22,3 +22,4 @@ coverage.xml
 .env.*
 !.github/dependabot.yml
 !notebooks/*.ipynb
+!examples/*.json

@@ -1,0 +1,25 @@
+{
+  "components": {
+    "J1": {
+      "role": "io"
+    },
+    "U1": {
+      "role": "processor"
+    },
+    "ANT1": {
+      "role": "antenna"
+    },
+    "U2": {
+      "role": "noisy"
+    }
+  },
+  "antenna_keepouts": {
+    "ANT1": {
+      "distance_mm": 8.0,
+      "against": "noisy",
+      "references": [
+        "U2"
+      ]
+    }
+  }
+}
