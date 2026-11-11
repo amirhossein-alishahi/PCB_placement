@@ -1,67 +1,91 @@
-# HARP-PCB Placement (prototype)
+# HARP-PCB — KiCad auto-placement prototype (v0.2)
 
-Auto-place **unrouted/unplaced** KiCad `.kicad_pcb` boards whose footprints initially overlap, and generate a new rectangular `Edge.Cuts` outline. Geometric validation is performed before a result is written.
+> **Geometric placement research tool, not a production board designer.**
+> The engine does **not** route traces, perform formal KiCad DRC, determine genuine footprints from part numbers, or guarantee that arbitrary mechanical/electrical requirements are met.
 
-> **Scope:** This is a prototype placement and board-sizing engine; **not** a router or formal DRC checker. No claim of production-safe or electrically optimal layout is made. For boards with mechanical, thermal, high-voltage, RF or assembly constraints, have an engineer review placement and run KiCad DRC and routing. The engine conservatively uses rectangular bounds, even for non-rectangular courtyards.
+HARP-PCB reads an **unrouted** KiCad `.kicad_pcb` containing pads/net assignments; footprints may all overlap at `(0,0)` **or already have arbitrary, even wrong, positions and rotations**. It discards the existing placement, builds a new **rectangular** board outline, legalizes bounding boxes, then runs a pin-weighted local optimization. Original pad geometry, footprint content, UUIDs, and board nets are verified unchanged.
+
+**Supports:** rectilinear board auto-sizing; existing overlapping or nonzero starting coordinates; explicit connector/outward-face constraints and a limited `PCB Edge` marker heuristic; stage-by-stage KiCad and PNG snapshots; synthetic footprint warnings and safety gate; strict validation after every saved snapshot.
+
+**Does not support generically:** non-rectangular/cutout-aware placement, arbitrary part-specific placement rules, 3D mechanical access verification, locked mounting holes, previously routed tracks/vias, or copper zones. Some footprint shapes and both PCB sides may need a KiCad-level mechanical audit; bounding boxes are approximations. A complex outline is rejected unless explicitly replaced. Existing routes, vias or zones are rejected to avoid corrupting an existing design.
 
 ## Google Colab
 
-Open [`notebooks/HARP_PCB_Colab.ipynb`](notebooks/HARP_PCB_Colab.ipynb) in Colab, run cells in order, upload your **unplaced** KiCad PCB, and download a ZIP containing:
+[Open the notebook](https://colab.research.google.com/github/amirhossein-alishahi/PCB_placement/blob/main/notebooks/HARP_PCB_Colab.ipynb)
 
-- `placed.kicad_pcb` — moved footprints and new rectangular board outline
-- `placement_report.json` — basic geometry/connectivity checks
-- `placement_preview.png` — simple geometry preview
+Run the notebook in order. It installs this repository, accepts one `.kicad_pcb`, shows a **preflight audit**, permits reference-indexed edge rules, then generates `placed.kicad_pcb`, a preview image, JSON report, and optionally a `stages/` folder with inspected KiCad checkpoint boards and previews. A drop-down allows viewing the stages.
 
-**No API key required for placement.** The first Colab cell includes an optional masked IntelCAD API key and a model choice (`cc/claude-haiku-5-5` / `cc/claude-opus-5-5`), strictly for a report-only AI review. The selected AI model does **not** control placement or validate physical design. A report sent to an external AI service should not contain confidential information.
+**No API key is required.** The optional `https://ai-router.intelcad.ai/v1` call using `cc/claude-haiku-5-5` or `cc/claude-opus-5-5` only summarizes aggregate report statistics, never edits or validates geometry. It is off by default, and key entry is masked.
 
-## Local CLI
+## Local installation and quick start
 
 ```bash
 python -m pip install -e '.[preview]'
-harp-pcb unplaced.kicad_pcb -o placed.kicad_pcb \
-  --preview placed.png --report placement_report.json \
-  --iterations 3000 --seed 42 --clearance 0.65 --edge-margin 2.0
-harp-pcb placed.kicad_pcb --verify
+python -m harp_pcb your_board.kicad_pcb --preflight-only --report preflight.json
+python -m harp_pcb your_board.kicad_pcb -o placed.kicad_pcb \
+  --preview placed.png --report report.json --iterations 4000 --seed 42 \
+  --stages-dir stages --snapshot-every 1000
 ```
 
-- Input must have footprints with actual pads, no routed segments/vias/zones; existing outline may be replaced.
-- `--clearance` and `--edge-margin` are simplified geometric proxies, **not** substitutes for correct KiCad design rules.
-- An overlaid footprint at `(0,0)` is a valid input; output preserves pad local positions, net table, footprint internals and UUIDs while changing footprint positions and text property positions.
-- Some exotic KiCad footprints/courtyard shapes are conservatively enclosed by a bounding rectangle; missing courtyards receive a pad-based fallback envelope.
-- **Do not commit private customer board files or API keys to this public repository.** `.gitignore` excludes KiCad design and generated output files.
+If the input contains fabricated `SYNTH_...` land patterns or embedded `SYNTHETIC - NOT A REAL LAND PATTERN` text, the software **blocks normal placement**. You must replace the placeholder with an actual, verified land pattern. To intentionally run a **non-manufacturing geometry experiment**, use `--allow-unverified-footprints`. This **does not fix** fake pad locations or remove the warning text.
 
-## Quality gates and release automation
+The tool also blocks **ambiguous access-facing** components (USB/SD-side access/slide switches) unless given a direction rule. `--allow-unresolved-orientation` explicitly disables this safety gate for experiments, but cannot guarantee functionality.
 
-CI on every push to `main` and every pull request:
-- Python 3.10 / 3.12 / 3.13 test matrix
-- syntax and Ruff correctness checks
-- tests against synthetic boards (no real customer data)
-- installed CLI smoke test
-- distribution build and downloadable Actions artifact
+### Mechanical direction constraints
 
-CD on a new `v*` Git tag validates tests, builds wheel/sdist and publishes a **GitHub Release** with those files. Nothing is automatically published to PyPI or deployed to a hosted service. GitHub Actions secrets are not needed for ordinary CI or releases.
+Create `edge_rules.json`:
 
-Developer commands:
+```json
+{
+  "components": {
+    "J1": {"side": "right", "outward_local": "right", "edge_offset_mm": 0.5},
+    "J2": {"side": "bottom", "outward_local": "right", "edge_offset_mm": 0.5},
+    "SW1": {"side": "any", "outward_local": "top", "edge_offset_mm": 0.5}
+  }
+}
+```
+
+`side` is the desired external board side (`left`, `right`, `top`, `bottom`, or `any`). `outward_local` is the direction the **opening faces in the unrotated footprint's own board coordinates**. At 0°: `right` is local +X, `top` is local -Y. If the connector opens toward local +X and is placed on the top edge, the footprint must be rotated 90° counterclockwise (KiCad convention). This direction must be confirmed from footprint drawings or the datasheet. A `PCB Edge` text marker on a documentation/fabrication layer can be used to infer an opening direction when unambiguous; other parts require user guidance. Geometry checks ensure a correctly rotated, edge-adjacent bbox (not genuine mechanical fit/connector mating).
+
+```bash
+python -m harp_pcb your_board.kicad_pcb -o placed.kicad_pcb \
+  --direction-rules edge_rules.json --stages-dir stages \
+  --iterations 4000 --snapshot-every 1000
+```
+
+**Notes:** Edge-adjacent parts are kept at a specified offset from their bbox to the outline; this is not a plated edge connector design rule. The placer will not automatically route connector pins or guarantee user access. For rigid fixed mechanical coordinates you must implement and verify more constraints before manufacturing.
+
+### Intermediate results
+
+With `--stages-dir stages`, output contains:
+
+- `01_greedy.kicad_pcb` and PNG: complete legal placement before optimization;
+- optionally `anneal_XXXXXX` checkpoints taken at `--snapshot-every N` iterations;
+- optimized complete placement before board shrink;
+- final auto-sized KiCad board;
+- `manifest.json` specifying stage order and preview paths.
+
+Each snapshot is independently checked for net/pad integrity, bounding-box separation, side orientation, and placement within the corresponding outline. The starting input can have all parts overlapped; it is intentionally **not** emitted as a valid placement snapshot.
+
+### Nonrectangular outlines and routed designs
+
+The engine defaults to replacing a simple rectangle. If Edge.Cuts represents circles, arcs, cutouts, polygons, or unsupported geometry, the placer **refuses** to destroy those design constraints. You can explicitly force conversion with `--replace-nonrectangular-outline`, but only if replacing the mechanical geometry is truly acceptable. No arbitrary board shapes/cutouts are legalized currently.
+
+Input with `segment`, `arc`, `via`, or `zone` is refused because moving footprints would invalidate copper geometry; **do not** remove these objects blindly.
+
+## Quality gates
+
+`pytest` exercises arbitrary pre-placed footprint coordinates, no-overlap legalization, cardinal side + rotation for all four external faces, marker inference, synthetic refusal, ambiguous direction refusal, nonrectangular safety, source integrity, intermediate stages, and Colab notebook syntax. GitHub Actions runs Python 3.10, 3.12, 3.13, Ruff, pytest and package build; a tagged `v*` push triggers a GitHub Release workflow. GitHub Actions success and branch policies must be separately confirmed in GitHub.
 
 ```bash
 python -m pip install -e '.[dev,preview]'
-python -m ruff check harp_pcb.py tests
 python -m pytest -q
+python -m ruff check harp_pcb.py tests
 python -m build
 ```
 
-## Validation boundaries
+## Final checks before using the output
 
-A passing report checks that footprints/pads/net definitions remain present and checks approximate bounding-box clearances and a valid rectangular outline. It **does not** certify EDA correctness (DRC-clean, routability, manufacturability, 3D collision, thermal constraints, impedance or connectivity after routing).
+Open `placed.kicad_pcb` in **KiCad**, replace every unverified footprint, inspect connector side and mating envelope, run `kicad-cli pcb drc`, and route all nets before manufacturing. The program currently validates only geometry approximations and textual structural preservation; no claim of DRC-clean board, complete routing, shortest electrical path, or manufacturing quality is implied.
 
-To run formal KiCad DRC on a machine with KiCad installed:
-
-```bash
-kicad-cli pcb drc -o drc_report.txt placed.kicad_pcb
-```
-
-Unrouted nets are expected because this package performs placement only. Open the result in KiCad before any downstream use.
-
-## Repository status
-
-Initial implementation is based on an experimentally tested Python placer; future improvements may add routability estimation and local placement repair. LLM-based coordinate placement was deliberately excluded for determinism and safety. Repository does not bundle third-party proprietary PCB source code.
+**Privacy:** This repository is public. The Colab workflow uploads your PCB to your Colab runtime; it is not committed to GitHub. Your private PCB and any API key must not be placed in public issues, commits, examples, or AI-report requests.

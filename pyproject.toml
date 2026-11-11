@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "harp-pcb-placement"
-version = "0.1.0"
-description = "Prototype automatic unplaced KiCad PCB footprint placement and board sizing"
+version = "0.2.0"
+description = "KiCad PCB placement prototype with edge direction rules and stage snapshots"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24"]

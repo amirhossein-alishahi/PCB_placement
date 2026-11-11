@@ -127,3 +127,138 @@ def test_property_transform_preserves_absolute_position():
     output = h.edit_board(original, parts, result['width'], result['height'],
                           result['origin_x'], result['origin_y'])
     assert h.verify(original, output)['pads_and_nets_unchanged']
+
+
+def change_positions(data: str, num_parts: int) -> str:
+    """Scatter already-positioned footprints to test genuine full re-placement."""
+    for i in range(num_parts):
+        name = f'Test:Sample_{i}'
+        prefix = f'(footprint "{name}" (layer "F.Cu") (at 0 0 0)'
+        replacement = f'(footprint "{name}" (layer "F.Cu") (at {110+i*7} {60+i*3} 180)'
+        assert prefix in data
+        data = data.replace(prefix, replacement)
+        # Board-level fields in the sample fixture are absolute.
+        # They are intentionally left untouched here; relocation should not break
+        # the relative transform verification.
+    return data
+
+
+def access_board(marker=False):
+    src = board(num_parts=6)
+    src = src.replace('Test:Sample_0', 'Connector:USB_C_Receptacle', 1)
+    if marker:
+        target = '(property "Value" "TEST" (at 0 3 0))'
+        src = src.replace(target, target+'\n    (fp_text user "PCB Edge" (at 5 0) (layer "Dwgs.User"))',1)
+    return src
+
+
+def test_placed_input_is_fully_replaced(tmp_path):
+    src=change_positions(board(8),8)
+    assert all(float(h.child(p.node,'at')[1])>100 for p in h.decode_parts(h.parse(src)))
+    path=tmp_path/'preplaced.kicad_pcb';out=tmp_path/'new.kicad_pcb'
+    path.write_text(src)
+    proc=subprocess.run([sys.executable,'-m','harp_pcb',str(path),'-o',str(out),'--iterations','60'],
+                        capture_output=True,text=True,timeout=100)
+    assert proc.returncode==0,proc.stderr
+    a=h.verify(src,out.read_text());assert a['unique_placements']==8
+    assert any(abs(float(h.child(p.node,'at')[1])-110)>3 for p in h.decode_parts(h.parse(out.read_text())))
+
+
+def test_orientation_missing_is_blocked(tmp_path):
+    path=tmp_path/'access.kicad_pcb';out=tmp_path/'out.kicad_pcb'
+    path.write_text(access_board())
+    proc=subprocess.run([sys.executable,'-m','harp_pcb',str(path),'-o',str(out),'--iterations','50'],
+                        capture_output=True,text=True,timeout=90)
+    assert proc.returncode!=0 and 'Ambiguous access direction' in proc.stderr
+    assert not out.exists()
+
+
+def test_marked_usb_faces_out_and_staged_snapshots(tmp_path):
+    src=access_board(marker=True)
+    path=tmp_path/'marked.kicad_pcb';out=tmp_path/'out.kicad_pcb'
+    path.write_text(src)
+    stage=tmp_path/'stages'
+    proc=subprocess.run([sys.executable,'-m','harp_pcb',str(path),'-o',str(out),
+                         '--iterations','105','--snapshot-every','50','--stages-dir',str(stage),
+                         '--report',str(tmp_path/'report.json')],capture_output=True,text=True,timeout=120)
+    assert proc.returncode==0,proc.stderr
+    audit=json.loads((tmp_path/'report.json').read_text())
+    assert audit['footprint_audit']['edge_rules']['U1']['outward_local']=='right'
+    assert audit['footprint_audit']['edge_rules']['U1']['evidence']=='footprint-PCB-Edge-marker'
+    assert len(audit['stages'])==5
+    for st in audit['stages']:
+        assert (stage/st['pcb']).exists() and (stage/st['preview']).exists()
+    parts=h.decode_parts(h.parse(out.read_text()))
+    usb=next(p for p in parts if p.name=='U1')
+    assert usb.angle in (0,90,180,270)
+    rules=h.apply_direction_rules(parts)['edge_rules']
+    assert rules['U1']['outward_local']=='right'
+    assert h.verify(src,out.read_text(),direction_rules={'U1':usb.edge_rule})['validated_outward_facing']==['U1']
+
+
+@pytest.mark.parametrize('side,local,angle',[
+    ('right','right',0),('top','right',90),('left','right',180),('bottom','right',270)])
+def test_explicit_facing_on_four_edges(tmp_path,side,local,angle):
+    src=access_board()
+    path=tmp_path/'in.kicad_pcb';out=tmp_path/'out.kicad_pcb'
+    cfg=tmp_path/'directions.json';path.write_text(src)
+    cfg.write_text(json.dumps({'components':{'U1':{'side':side,'outward_local':local,'edge_offset_mm':0.5}}}))
+    proc=subprocess.run([sys.executable,'-m','harp_pcb',str(path),'-o',str(out),
+                         '--direction-rules',str(cfg),'--iterations','50'],
+                        capture_output=True,text=True,timeout=120)
+    assert proc.returncode==0,proc.stderr
+    p=next(p for p in h.decode_parts(h.parse(out.read_text())) if p.name=='U1')
+    assert int(float(h.child(p.node,'at')[3]))==angle
+    checks=h.verify(src,out.read_text(),direction_rules={'U1':h.EdgeRule(side,local,0.5)})
+    assert checks['validated_outward_facing']==['U1']
+
+
+def test_synthetic_footprint_halts_and_preflight_can_report(tmp_path):
+    src=board().replace('Test:Sample_0','SYNTH_FAKE_LAND_PATTERN',1)
+    path=tmp_path/'in.kicad_pcb';out=tmp_path/'out.kicad_pcb';path.write_text(src)
+    proc=subprocess.run([sys.executable,'-m','harp_pcb',str(path),'-o',str(out)],
+                        capture_output=True,text=True,timeout=90)
+    assert proc.returncode!=0 and 'Synthetic/placeholder' in proc.stderr
+    assert not out.exists()
+    report=tmp_path/'preflight.json'
+    pre=subprocess.run([sys.executable,'-m','harp_pcb',str(path),'--preflight-only','--report',str(report)],
+                       capture_output=True,text=True,timeout=90)
+    assert pre.returncode==0
+    assert json.loads(report.read_text())['synthetic_footprints'][0]['ref']=='U1'
+
+
+def test_rule_file_rejects_unknown_ref_or_invalid_vector(tmp_path):
+    parts=h.decode_parts(h.parse(board()))
+    with pytest.raises(ValueError,match='Unknown component'):
+        h.apply_direction_rules(parts,{'components':{'NOT_REAL':{'side':'right','outward_local':'right'}}})
+    with pytest.raises(ValueError,match='cardinal'):
+        h.apply_direction_rules(parts,{'components':{'U1':{'side':'east','outward_local':'northwest'}}})
+
+
+def test_nonrectangular_outline_rejected_without_opt_in(tmp_path):
+    src=board()+''
+    src=src[:src.rfind(')')]+'''(gr_circle (center 20 20) (end 40 20)
+          (stroke (width 0.1) (type default)) (fill none) (layer "Edge.Cuts"))\n)'''
+    p=tmp_path/'circle.kicad_pcb';out=tmp_path/'out.kicad_pcb';p.write_text(src)
+    run=subprocess.run([sys.executable,'-m','harp_pcb',str(p),'-o',str(out)],
+                       text=True,capture_output=True,timeout=90)
+    assert run.returncode!=0 and 'nonrectangular' in run.stderr
+    assert not out.exists()
+    okay=subprocess.run([sys.executable,'-m','harp_pcb',str(p),'-o',str(out),
+                         '--replace-nonrectangular-outline','--iterations','50'],
+                        text=True,capture_output=True,timeout=90)
+    assert okay.returncode==0,okay.stderr
+    assert h.outline_rect(h.parse(out.read_text())) is not None
+
+
+def test_notebook_code_is_syntax_valid_and_has_no_secrets():
+    import ast
+    nbpath=Path(__file__).resolve().parents[1]/'notebooks/HARP_PCB_Colab.ipynb'
+    notebook=json.loads(nbpath.read_text())
+    assert notebook['nbformat']==4
+    script='\n'.join(''.join(cell['source']) for cell in notebook['cells'] if cell['cell_type']=='code')
+    ast.parse(script)
+    assert 'files.upload()' in script and 'files.download(' in script
+    assert 'getpass(' in script
+    assert 'USE_LLM_REPORT = False' in script
+    assert 'ALLOW_UNVERIFIED_FOOTPRINTS = False' in script

@@ -28,6 +28,19 @@ jobs:
         run: python -m ruff check harp_pcb.py tests
       - name: Unit and integration tests
         run: python -m pytest -q
+      - name: Validate notebook JSON and Python cells
+        run: |
+          python - <<'PY'
+          import ast, json
+          from pathlib import Path
+          p=Path('notebooks/HARP_PCB_Colab.ipynb')
+          nb=json.loads(p.read_text())
+          assert nb['nbformat']==4
+          for cell in nb['cells']:
+              if cell['cell_type']=='code':
+                  ast.parse(''.join(cell['source']))
+          print('Notebook cells parse successfully')
+          PY
       - name: Installed CLI smoke test
         run: harp-pcb --help
   build:

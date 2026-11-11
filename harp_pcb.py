@@ -136,6 +136,200 @@ def rot_xy(x: float, y: float, angle: int):
     return x*math.cos(rad)+y*math.sin(rad), -x*math.sin(rad)+y*math.cos(rad)
 
 
+@dataclass(frozen=True)
+class EdgeRule:
+    """A hard mechanical-facing rule. `outward_local` is the footprint-local vector
+    pointing through an opening. It MUST be supported by a marker or entered by
+    the designer, never guessed solely from an SD/USB/switch name.
+    """
+    side: str  # left | right | top | bottom | any
+    outward_local: str  # left | right | top | bottom
+    edge_offset_mm: float = 0.5
+    evidence: str = "user"
+
+
+DIRECTIONS = {"left": (-1, 0), "right": (1, 0),
+              "top": (0, -1), "bottom": (0, 1)}
+ACCESS_RE = re.compile(
+    r"usb|microusb|usb_c|rj45|ethernet_jack|micro.?sd|sdcard|sd.?socket|"
+    r"hdmi|displayport|audiojack|audio_jack|barreljack|barrel_jack|"
+    r"switch.?slide|slide.?switch|sideswitch|side.?actuat", re.I)
+SYNTH_RE = re.compile(r"synthetic\s*[-:]\s*not\s+a\s+real\s+land\s+pattern|"
+                      r"not\s+a\s+real\s+land\s+pattern", re.I)
+
+
+def marker_facing(part):
+    """Find explicit PCB Edge mark INSIDE the footprint, never infer facing from name.
+
+    Markers must be in a user/documentation layer with a local (at x y). The
+    vector from the pad centroid to marker determines the nearest cardinal face.
+    """
+    candidates = []
+    for node in part.node:
+        if not isinstance(node, list) or not node or node[0] not in ('fp_text', 'property'):
+            continue
+        if not any('pcb edge' in str(v).lower() for v in node[1:3]):
+            continue
+        layer = str(get(node, 'layer', ''))
+        if layer not in ('Dwgs.User', 'Cmts.User', 'F.Fab', 'B.Fab'):
+            continue
+        at = child(node, 'at')
+        if not at or len(at) < 3:
+            continue
+        candidates.append((fnum(at[1]), fnum(at[2])))
+    if not candidates or not part.pads:
+        return None
+    px = sum(p.x for p in part.pads) / len(part.pads)
+    py = sum(p.y for p in part.pads) / len(part.pads)
+    vx = sum(x for x, _ in candidates) / len(candidates) - px
+    vy = sum(y for _, y in candidates) / len(candidates) - py
+    if max(abs(vx), abs(vy)) < 0.75:
+        return None
+    if abs(vx) > 1.25 * abs(vy):
+        return 'right' if vx > 0 else 'left'
+    if abs(vy) > 1.25 * abs(vx):
+        return 'bottom' if vy > 0 else 'top'
+    return None
+
+
+def footprint_audit(parts):
+    flagged = []
+    directional = []
+    for p in parts:
+        suspicious = p.footprint.upper().startswith('SYNTH_')
+        suspicious |= any(isinstance(n, list) and n and n[0] in ('fp_text', 'property')
+                          and any(SYNTH_RE.search(str(x)) for x in n[1:3])
+                          for n in p.node)
+        if suspicious:
+            flagged.append({'ref': p.name, 'footprint': p.footprint,
+                            'reason': 'Placeholder/synthetic land pattern; check against datasheet'})
+        if ACCESS_RE.search(p.footprint) or ACCESS_RE.search(p.name):
+            directional.append({'ref': p.name, 'footprint': p.footprint,
+                                'marker_facing': marker_facing(p),
+                                'resolved': False})
+    return flagged, directional
+
+
+def apply_direction_rules(parts, config=None):
+    """Attach mechanically enforced edge constraints; return audit information."""
+    config = config or {}
+    if not isinstance(config, dict):
+        raise ValueError('Direction rules must be a JSON object')
+    unknown = set(config) - {'components'}
+    if unknown:
+        raise ValueError(f'Unknown direction rules keys: {sorted(unknown)}')
+    rules = config.get('components', {})
+    if not isinstance(rules, dict):
+        raise ValueError('"components" must be an object indexed by reference')
+    known = {p.name for p in parts}
+    if set(rules) - known:
+        raise ValueError(f'Unknown component references: {sorted(set(rules)-known)}')
+    synthetic, directional = footprint_audit(parts)
+    for p in parts:
+        cfg = rules.get(p.name)
+        if cfg is not None:
+            if not isinstance(cfg, dict):
+                raise ValueError(f'{p.name}: direction rule must be an object')
+            side = str(cfg.get('side', 'any')).lower()
+            outward = str(cfg.get('outward_local', '')).lower()
+            gap = float(cfg.get('edge_offset_mm', 0.5))
+            if side not in (*DIRECTIONS, 'any') or outward not in DIRECTIONS:
+                raise ValueError(f'{p.name}: side and outward_local must be cardinal directions')
+            if not 0 <= gap <= 5 or not math.isfinite(gap):
+                raise ValueError(f'{p.name}: edge_offset_mm must be between 0 and 5')
+            p.edge_rule = EdgeRule(side, outward, gap, 'explicit-user-rule')
+        else:
+            facing = marker_facing(p)
+            if facing:
+                p.edge_rule = EdgeRule('any', facing, 0.5, 'footprint-PCB-Edge-marker')
+    for item in directional:
+        p = next(p for p in parts if p.name == item['ref'])
+        item['resolved'] = bool(p.edge_rule)
+        item['resolution'] = p.edge_rule.evidence if p.edge_rule else 'unknown-facing-needs-review'
+    return {'synthetic_footprints': synthetic,
+            'directional_candidates': directional,
+            'edge_rules': {p.name: vars(p.edge_rule) for p in parts if p.edge_rule},
+            'unresolved_directions': [r['ref'] for r in directional if not r['resolved']]}
+
+
+def outward_side(part, angle):
+    if not part.edge_rule:
+        return None
+    v = DIRECTIONS[part.edge_rule.outward_local]
+    x, y = rot_xy(*v, angle)
+    return max(DIRECTIONS, key=lambda direction: x*DIRECTIONS[direction][0]
+               + y*DIRECTIONS[direction][1])
+
+
+def allowed_angles(part):
+    if not part.edge_rule or part.edge_rule.side == 'any':
+        return (0, 90, 180, 270)
+    return tuple(a for a in (0, 90, 180, 270)
+                 if outward_side(part, a) == part.edge_rule.side)
+
+
+def edge_gap(b, side, W, H):
+    return {'left': b[0], 'right': W-b[2], 'top': b[1], 'bottom': H-b[3]}[side]
+
+
+def valid_envelope(part, x, y, angle, W, H, margin):
+    b = part.bbox(x, y, angle)
+    if not part.edge_rule:
+        return within(b, W, H, margin)
+    side = outward_side(part, angle)
+    if part.edge_rule.side != 'any' and side != part.edge_rule.side:
+        return False
+    desired = part.edge_rule.edge_offset_mm
+    if abs(edge_gap(b, side, W, H) - desired) > 0.16:
+        return False
+    if min(edge_gap(b, d, W, H) for d in DIRECTIONS if d != side) < margin - 1e-5:
+        return False
+    return True
+
+
+def snap_to_edge(part, x, y, angle, W, H):
+    """Project candidate onto the correct edge while retaining tangential freedom."""
+    side = outward_side(part, angle)
+    if side is None:
+        return x, y
+    b = part.bbox(x, y, angle)
+    delta = edge_gap(b, side, W, H) - part.edge_rule.edge_offset_mm
+    if side == 'left': x -= delta
+    elif side == 'right': x += delta
+    elif side == 'top': y -= delta
+    else: y += delta
+    return x, y
+
+
+def edge_candidates(part, W, H, margin, rng):
+    """Generate legal edge anchors for explicit/marker-derived rules."""
+    candidates = []
+    for a in allowed_angles(part):
+        side = outward_side(part, a)
+        o = part.offsets(a)
+        if side in ('left', 'right'):
+            low, high = margin-o[1], H-margin-o[3]
+            if low > high:
+                continue
+            count = max(2, int((high-low)/2.5)+1)
+            samples = [low+(high-low)*j/(count-1) for j in range(count)]
+            samples.sort(key=lambda y: abs(y+(o[1]+o[3])/2-H/2))
+            for y in samples:
+                x = part.edge_rule.edge_offset_mm-o[0] if side == 'left' else W-part.edge_rule.edge_offset_mm-o[2]
+                candidates.append((x, y, a))
+        else:
+            low, high = margin-o[0], W-margin-o[2]
+            if low > high:
+                continue
+            count = max(2, int((high-low)/2.5)+1)
+            samples = [low+(high-low)*j/(count-1) for j in range(count)]
+            samples.sort(key=lambda x: abs(x+(o[0]+o[2])/2-W/2))
+            for x in samples:
+                y = part.edge_rule.edge_offset_mm-o[1] if side == 'top' else H-part.edge_rule.edge_offset_mm-o[3]
+                candidates.append((x, y, a))
+    return candidates
+
+
 @dataclass
 class Pad:
     name: str
@@ -159,6 +353,7 @@ class Part:
     x: float = 0.0
     y: float = 0.0
     angle: int = 0
+    edge_rule: EdgeRule | None = None
 
     @property
     def area(self):
@@ -353,7 +548,7 @@ def wire_sum(edges,parts,changes=None):
 
 def legal_candidate(parts,idx,x,y,angle,placed,W,H,clearance,margin):
     b=parts[idx].bbox(x,y,angle)
-    if not within(b,W,H,margin):return False
+    if not valid_envelope(parts[idx],x,y,angle,W,H,margin):return False
     return all(not rects_intersect(b,parts[j].bbox(),clearance) for j in placed if j!=idx)
 
 
@@ -361,14 +556,38 @@ def greedy_place(parts,edges,W,H,clearance,margin,rng):
     n=len(parts)
     touch=grouped_edges(edges,n)
     # Sort biggest first; connected medium parts placed early for useful anchors.
-    root=max(range(n),key=lambda i:(parts[i].area,len(parts[i].pads)))
-    bb0=parts[root].offsets(90 if parts[root].outline[3]-parts[root].outline[1] >
-                                 parts[root].outline[2]-parts[root].outline[0] else 0)
-    p=parts[root]
-    p.angle=90 if (p.outline[3]-p.outline[1]) > 1.25*(p.outline[2]-p.outline[0]) else 0
-    o=p.offsets();p.x=W/2-(o[0]+o[2])/2;p.y=H/2-(o[1]+o[3])/2
-    if not within(p.bbox(),W,H,margin): return False
-    placed={root};rem=set(range(n))-{root}
+    # Place hard mechanical anchors first. Never move an external-facing opening
+    # into the middle of the board just to reduce electrical HPWL.
+    placed = set()
+    pinned = sorted((i for i,p in enumerate(parts) if p.edge_rule),
+                    key=lambda i: -parts[i].area)
+    for i in pinned:
+        p=parts[i]
+        best=None
+        for x,y,a in edge_candidates(p,W,H,margin,rng):
+            if not legal_candidate(parts,i,x,y,a,placed,W,H,clearance,margin):
+                continue
+            score=sum(wire_between(e,parts,{i:(x,y,a)}) for e in touch[i]
+                      if (e.i if e.j==i else e.j) in placed)
+            score += 0.002*math.hypot(x-W/2,y-H/2)
+            if best is None or score < best[0]:best=(score,x,y,a)
+        if best is None:
+            return False
+        _,p.x,p.y,p.angle=best
+        placed.add(i)
+    free=[i for i in range(n) if i not in placed]
+    if free:
+        root=max(free,key=lambda i:(parts[i].area,len(parts[i].pads)))
+        p=parts[root]
+        p.angle=90 if (p.outline[3]-p.outline[1]) > 1.25*(p.outline[2]-p.outline[0]) else 0
+        o=p.offsets();p.x=W/2-(o[0]+o[2])/2;p.y=H/2-(o[1]+o[3])/2
+        if not legal_candidate(parts,root,p.x,p.y,p.angle,placed,W,H,clearance,margin):
+            # Root may overlap an edge anchor; let the general candidate search handle it.
+            free.remove(root)
+            free.insert(0,root)
+        else:
+            placed.add(root)
+    rem=set(range(n))-placed
     while rem:
         def priority(i):
             conn=sum(e.weight for e in touch[i] if (e.i if e.j==i else e.j) in placed)
@@ -428,7 +647,7 @@ def greedy_place(parts,edges,W,H,clearance,margin,rng):
     return True
 
 
-def optimize_local(parts,edges,W,H,clearance,margin,iterations,seed):
+def optimize_local(parts,edges,W,H,clearance,margin,iterations,seed,checkpoint=None,interval=0):
     rng=random.Random(seed)
     n=len(parts); touch=grouped_edges(edges,n)
     areas=[p.area for p in parts]
@@ -462,6 +681,10 @@ def optimize_local(parts,edges,W,H,clearance,margin,iterations,seed):
         else:
             sigma=2.0 if (step/iterations)>0.35 else 0.8
             nx,ny,na=x+rng.gauss(0,sigma),y+rng.gauss(0,sigma),a
+        if p.edge_rule:
+            if na not in allowed_angles(p):
+                continue
+            nx,ny=snap_to_edge(p,nx,ny,na,W,H)
         if not legal_candidate(parts,idx,nx,ny,na,(k for k in range(n) if k!=idx),W,H,clearance,margin):continue
         current=sum(wire_between(e,parts) for e in touch[idx]);
         new=sum(wire_between(e,parts,{idx:(nx,ny,na)}) for e in touch[idx]);
@@ -477,6 +700,8 @@ def optimize_local(parts,edges,W,H,clearance,margin,iterations,seed):
         if new<=current or rng.random()<math.exp(min(0.0,(current-new)/temp)):
             p.x,p.y,p.angle=nx,ny,na
             accepted+=1
+        if checkpoint and interval and (step + 1) % interval == 0:
+            checkpoint(f'anneal_{step+1:06}', parts, W, H)
     return accepted
 
 
@@ -490,7 +715,8 @@ def compact(parts,edge_margin,clearance):
     return x0,y0,x1-x0,y1-y0
 
 
-def place(parts,edges,clearance=0.65,margin=2.0,seed=42,iterations=8000):
+def place(parts,edges,clearance=0.65,margin=2.0,seed=42,iterations=8000,
+          checkpoint=None, checkpoint_interval=0):
     if np is None:
         raise RuntimeError('numpy is required for deterministic candidate generation')
     W,H=target_dims(parts,margin=margin)
@@ -504,10 +730,18 @@ def place(parts,edges,clearance=0.65,margin=2.0,seed=42,iterations=8000):
         if solutions:
             _,locations=min(solutions,key=lambda s:s[0])
             for p,(x,y,a) in zip(parts,locations):p.x,p.y,p.angle=x,y,a
-            accepted=optimize_local(parts,edges,W,H,clearance,margin,iterations,seed+1000003)
+            if checkpoint: checkpoint('greedy', parts, W, H)
+            accepted=optimize_local(parts,edges,W,H,clearance,margin,iterations,seed+1000003,
+                                    checkpoint=checkpoint, interval=checkpoint_interval)
+            if checkpoint: checkpoint('optimized', parts, W, H)
             # Source file has no shape constraints. Bounding rectangle is minimized
             # after final placement. No rewrite if legalization would be invalid.
-            x0,y0,bw,bh=compact(parts,margin,clearance)
+            if any(p.edge_rule for p in parts):
+                # The board edge itself is part of a mechanical facing constraint.
+                # Tight compaction would invalidate the specified opening offset.
+                x0,y0,bw,bh=0.0,0.0,W,H
+            else:
+                x0,y0,bw,bh=compact(parts,margin,clearance)
             ORIGIN=(100.0,80.0)
             for p in parts:
                 p.x+=ORIGIN[0]-x0;p.y+=ORIGIN[1]-y0
@@ -614,7 +848,7 @@ def outline_rect(tree):
     return bb if actual==expected else None
 
 
-def verify(source_text, output_text,clearance=0.65,margin=2.0):
+def verify(source_text, output_text,clearance=0.65,margin=2.0,direction_rules=None):
     old=parse(source_text);new=parse(output_text)
     if old[0]!='kicad_pcb' or new[0]!='kicad_pcb':raise AssertionError('Not KiCad PCB')
     if pad_signatures(old)!=pad_signatures(new):
@@ -657,8 +891,12 @@ def verify(source_text, output_text,clearance=0.65,margin=2.0):
     margin_bad=[]
     for p in ps:
         b=p.bbox()
-        if not (b[0]>=ox+margin-1e-4 and b[1]>=oy+margin-1e-4 and
-                b[2]<=ex-margin+1e-4 and b[3]<=ey-margin+1e-4):
+        # Constraint-based edge parts use explicit edge offset; other components
+        # retain the ordinary margin on every side.
+        rule = direction_rules.get(p.name) if direction_rules else None
+        if rule:
+            p.edge_rule = rule
+        if not valid_envelope(p,p.x-ox,p.y-oy,p.angle,ex-ox,ey-oy,margin):
             margin_bad.append((p.name,b))
     if margin_bad:raise AssertionError(f'Parts outside edge margin: {margin_bad}')
     hits=[]
@@ -681,7 +919,8 @@ def verify(source_text, output_text,clearance=0.65,margin=2.0):
             'courtyard_missing':sorted(p.name for p in ps if not p.has_courtyard),
             'synthetic_footprints':sorted(p.name for p in ps if p.footprint.startswith('SYNTH_')),
             'pads_and_nets_unchanged':True,'perimeter_and_clearance_pass':True,
-            'unique_placements':len(set((round(x,3),round(y,3)) for _,x,y,_ in at))}
+            'unique_placements':len(set((round(x,3),round(y,3)) for _,x,y,_ in at)),
+            'validated_outward_facing': sorted(direction_rules or {})}
 
 
 def preview(parts, report, out):
@@ -723,17 +962,51 @@ def cli(argv=None):
     ap.add_argument('--preview',type=Path,help='Optional PNG output')
     ap.add_argument('--report',type=Path,help='Optional JSON validation report')
     ap.add_argument('--verify',action='store_true',help='Only verify an already-placed board')
+    ap.add_argument('--direction-rules',type=Path,help='JSON {"components": {"J1": {"side":"right","outward_local":"right"}}}')
+    ap.add_argument('--allow-unverified-footprints',action='store_true',help='Explicitly accept synthetic placeholders for geometric experiments')
+    ap.add_argument('--allow-unresolved-orientation',action='store_true',help='Explicitly accept unknown directions; NOT safe for production')
+    ap.add_argument('--preflight-only',action='store_true',help='Write/list footprint and orientation issues without placement')
+    ap.add_argument('--replace-nonrectangular-outline',action='store_true',help='Explicitly replace an existing curved/polygon board edge with a rectangular one')
+    ap.add_argument('--stages-dir',type=Path,help='Save verified intermediate KiCad PCB snapshots and previews')
+    ap.add_argument('--snapshot-every',type=int,default=0,help='Write intermediate anneal snapshots every N iterations (requires --stages-dir)')
     args=ap.parse_args(argv)
-    if args.clearance<0 or args.edge_margin<0.5 or args.iterations<0:
-        ap.error('Clearance/iterations cannot be negative; edge margin must be >=0.5')
+    if args.clearance<0 or args.edge_margin<0.5 or args.iterations<0 or args.snapshot_every<0:
+        ap.error('Invalid clearance, margin, iterations or snapshot interval')
+    if args.snapshot_every and not args.stages_dir:
+        ap.error('--snapshot-every requires --stages-dir')
     source=args.input.read_text(encoding='utf-8')
     tree=parse(source)
     if tree[0]!='kicad_pcb':raise ValueError('Input is not a KiCad PCB file')
+    ps=decode_parts(tree)
+    rules_data=json.loads(args.direction_rules.read_text('utf-8')) if args.direction_rules else {}
+    audit=apply_direction_rules(ps,rules_data)
+    edge_nodes=[g for g in tree if isinstance(g,list) and g and g[0].startswith('gr_')
+                and get(g,'layer')=='Edge.Cuts']
+    straight_rectangle = outline_rect(tree) is not None
+    kicad_rect = len(edge_nodes)==1 and edge_nodes[0][0]=='gr_rect'
+    audit['outline']={'present':bool(edge_nodes),
+                      'nonrectangular_or_unsupported':bool(edge_nodes) and not (straight_rectangle or kicad_rect),
+                      'will_be_replaced_by_rectangle':True}
+    audit['existing_copper']={tag:len(children(tree,tag)) for tag in ('segment','arc','via','zone')}
+    rule_map={p.name:p.edge_rule for p in ps if p.edge_rule}
+    if args.preflight_only:
+        print(json.dumps(audit,indent=2,ensure_ascii=False))
+        if args.report:
+            args.report.parent.mkdir(parents=True,exist_ok=True)
+            args.report.write_text(json.dumps(audit,indent=2,ensure_ascii=False),encoding='utf-8')
+        return 0
     if args.verify:
-        # Structural validator needs original for comparison. Self-verification still
-        # ensures physical validity and net-table internal consistency.
-        result=verify(source,source,args.clearance,args.edge_margin)
+        result=verify(source,source,args.clearance,args.edge_margin,rule_map)
         print(json.dumps(result,indent=2,ensure_ascii=False));return 0
+    if audit['synthetic_footprints'] and not args.allow_unverified_footprints:
+        raise ValueError('Synthetic/placeholder footprints detected: '+', '.join(x['ref'] for x in audit['synthetic_footprints'])+
+                         '. Replace them with verified land patterns, or use --allow-unverified-footprints for geometry experiments only.')
+    if audit['unresolved_directions'] and not args.allow_unresolved_orientation:
+        raise ValueError('Ambiguous access direction for: '+', '.join(audit['unresolved_directions'])+
+                         '. Provide --direction-rules or explicitly use --allow-unresolved-orientation.')
+    if audit['outline']['nonrectangular_or_unsupported'] and not args.replace_nonrectangular_outline:
+        raise ValueError('Existing board outline is nonrectangular/unsupported. The rectangular placer cannot preserve it. '
+                         'Do not silently destroy mechanical geometry; explicitly use --replace-nonrectangular-outline if acceptable.')
     if not args.output:ap.error('Expected -o/--output')
     if args.output.resolve()==args.input.resolve():ap.error('Refusing to overwrite input file')
     for tag in ('segment','arc','via','zone'):
@@ -742,20 +1015,49 @@ def cli(argv=None):
     if any(get(g,'layer')=='Edge.Cuts' and g[0] not in ('gr_line','gr_rect','gr_arc','gr_circle','gr_poly')
            for g in tree if isinstance(g,list) and g and g[0].startswith('gr_')):
         raise ValueError('Unsupported Edge.Cuts object detected')
-    ps=decode_parts(tree)
     edges=make_edges(ps)
     start=time.perf_counter()
-    result=place(ps,edges,args.clearance,args.edge_margin,args.seed,args.iterations)
+    stages=[]
+    if args.stages_dir:
+        args.stages_dir.mkdir(parents=True,exist_ok=True)
+    def save_checkpoint(name,components,W,H):
+        if not args.stages_dir:return
+        idx=len(stages)+1
+        basename=f'{idx:02d}_{name}'
+        fp=args.stages_dir/(basename+'.kicad_pcb')
+        snap=edit_board(source,components,W,H,0.0,0.0)
+        check=verify(source,snap,args.clearance,args.edge_margin,rule_map)
+        fp.write_text(snap,encoding='utf-8')
+        pic=args.stages_dir/(basename+'.png')
+        preview(components,{'origin_x':0.0,'origin_y':0.0,'width':W,'height':H},pic)
+        stages.append({'name':name,'pcb':fp.name,'preview':pic.name,
+                       'board_area_mm2':check['board_area_mm2']})
+    result=place(ps,edges,args.clearance,args.edge_margin,args.seed,args.iterations,
+                 checkpoint=save_checkpoint if args.stages_dir else None,
+                 checkpoint_interval=args.snapshot_every)
     output=edit_board(source,ps,result['width'],result['height'],result['origin_x'],result['origin_y'])
-    checks=verify(source,output,args.clearance,args.edge_margin)
+    checks=verify(source,output,args.clearance,args.edge_margin,rule_map)
+    if args.stages_dir:
+        last=args.stages_dir/(f'{len(stages)+1:02d}_final.kicad_pcb')
+        last.write_text(output,encoding='utf-8')
+        pic=args.stages_dir/(f'{len(stages)+1:02d}_final.png')
+        preview(ps,result,pic)
+        stages.append({'name':'final','pcb':last.name,'preview':pic.name,'board_area_mm2':checks['board_area_mm2']})
+        (args.stages_dir/'manifest.json').write_text(json.dumps(stages,indent=2),encoding='utf-8')
     result.update(checks)
     result['proxy_wirelength_weighted_mm']=round(result.pop('wire_proxy'),3)
     result['runtime_seconds']=round(time.perf_counter()-start,2)
-    result['warning']='Not routed; KiCad DRC and footprint/manufacturing review required.'
+    result['footprint_audit']=audit
+    result['stages']=stages
+    result['warning']='Unrouted placement only. KiCad DRC, actual part footprints, opening direction and manufacturing review are required.'
     args.output.parent.mkdir(parents=True,exist_ok=True)
     args.output.write_text(output,encoding='utf-8')
-    if args.preview:preview(ps,result,args.preview)
-    if args.report:args.report.write_text(json.dumps(result,indent=2,ensure_ascii=False),encoding='utf-8')
+    if args.preview:
+        args.preview.parent.mkdir(parents=True,exist_ok=True)
+        preview(ps,result,args.preview)
+    if args.report:
+        args.report.parent.mkdir(parents=True,exist_ok=True)
+        args.report.write_text(json.dumps(result,indent=2,ensure_ascii=False),encoding='utf-8')
     print(json.dumps(result,indent=2,ensure_ascii=False))
     return 0
 
