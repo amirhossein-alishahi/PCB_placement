@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling>=1.25,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "harp-pcb-placement"
+version = "0.1.0"
+description = "Prototype automatic unplaced KiCad PCB footprint placement and board sizing"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
+]
+
+[project.optional-dependencies]
+preview = ["matplotlib>=3.7"]
+dev = ["pytest>=8", "shapely>=2.0", "ruff>=0.8,<1", "build>=1.2"]
+
+[project.scripts]
+harp-pcb = "harp_pcb:cli"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["harp_pcb.py"]
+
+[tool.hatch.build.targets.sdist]
+include = ["harp_pcb.py", "pyproject.toml", "README.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 110
+
+[tool.ruff.lint]
+# Focus CI on correctness rather than enforcing a reformat of the legacy prototype.
+select = ["E4", "E9", "F63", "F7", "F82"]
