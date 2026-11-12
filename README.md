@@ -1,9 +1,9 @@
-# HARP-PCB — KiCad auto-placement prototype (v0.4)
+# HARP-PCB — KiCad auto-placement prototype (v0.5)
 
 > **Geometric placement research tool, not a production board designer.**
 > The engine does **not** route traces, perform formal KiCad DRC, determine genuine footprints from part numbers, or guarantee that arbitrary mechanical/electrical requirements are met.
 
-HARP-PCB reads an **unrouted** KiCad `.kicad_pcb` containing pads/net assignments; footprints may all overlap at `(0,0)` **or already have arbitrary, even wrong, positions and rotations**. It discards the existing placement, builds a new **rectangular** board outline, legalizes bounding boxes, then runs a pin-weighted local optimization. Original pad geometry, footprint content, UUIDs, and board nets are verified unchanged.
+HARP-PCB reads an **unrouted** KiCad `.kicad_pcb` containing pads/net assignments; footprints may all overlap at `(0,0)` **or already have arbitrary, even wrong, positions and rotations**. It discards the existing placement, builds a new **rectangular** board outline, legalizes bounding boxes, then runs a pin-weighted local optimization. For ordinary placement, pad geometry, footprint content, UUIDs and board nets remain unchanged. **When guarded substitution is enabled**, the approved donor geometry replaces synthetic geometry, while original footprint references, board nets, pad numbers and per-pad net assignments are preserved. A change of footprint geometry is logged explicitly; mechanical compatibility and manufacturer pad-function mapping remain unverified.
 
 **Supports:** rectilinear board auto-sizing; existing overlapping or nonzero starting coordinates; explicit connector/outward-face constraints and a limited `PCB Edge` marker heuristic; stage-by-stage KiCad and PNG snapshots; non-blocking synthetic footprint and ambiguous opening-direction warnings, optional AI preflight advice, and geometry validation after every saved snapshot.
 
@@ -17,6 +17,52 @@ Run the notebook in order. It installs this repository, accepts one `.kicad_pcb`
 
 **No API key is required.** With `USE_LLM_PREFLIGHT = True` and a key entered in the masked prompt, the optional `https://ai-router.intelcad.ai/v1` request asks `cc/claude-haiku-5-5` or `cc/claude-opus-5-5` to diagnose flagged issues and suggest **unverified** library footprint candidates. Only flagged reference/value/footprint identifiers and pad counts are shared; no raw PCB file, routing, nets, or pad positions. Failed requests fall back locally, without blocking placement. AI recommendations are **never applied automatically** because changing land patterns safely requires datasheet and pad-map verification. Aggregate report explanation is also optional.
 
+
+
+## New in v0.5 — guarded footprint repairs and pin-aware intent
+
+- **Best-effort same-part footprint reuse:** If a synthetic footprint has an **exactly matching Value** and pad-number multiset to one non-synthetic part already present on the board, geometry may be reused (e.g. the synthetic `U6` header from `U5` in the test design). This does **not** validate the donor's library or manufacturer pin functions. Disable with `--no-auto-reuse`.
+- **Explicit reviewed `.kicad_mod` substitution:** Supply a mapping file. A candidate must have exactly the same pad-number multiset; every original pad's net assignment, reference and board net table are preserved. An optional SHA256 locks the file to reviewed bytes. Invalid/missing/mismatched candidates are skipped with a warning, not silently forced.
+- **Known-part Colab example:** For exact part value `STM32F410CBT6` with a 48-pad synthetic footprint, the Colab notebook can request `Package_QFP:LQFP-48_7x7mm_P0.5mm` from KiCad's official footprint GitLab. ST lists the part's package as LQFP-48 7×7 mm. This **does not prove pad-number-to-signal correctness**; verify ST's pin table and KiCad DRC. The notebook falls back if the download fails.
+- **Part-specific pinout preflight:** For the exact STM32F410CBT6/LQFP48, existing net labels explicitly describing U3 pin functions are checked against ST DS11144. The check is **partial** and cannot certify unlabeled nets. A known label mismatch blocks an automatic substitution of that part, but the geometry-only workflow continues and reports why.
+- **Pin-aware soft edges:** The solver adds extra attraction between oscillator pads and real matching microcontroller nets, and between decoupling capacitors and a **uniquely identifiable** host supply pin. Shared VDD/GND across multiple ICs are explicitly marked ambiguous, not invented. Provide manual verified pin relationships where necessary.
+- **Role classification:** Exact known connector identifiers including `SBH11` in **Value** are detected as I/O regardless of synthetic footprint names.
+
+Example `footprint_replacements.json` (use the correct file path and real library identifier):
+
+```json
+{
+  "components": {
+    "U3": {
+      "file": "LQFP-48_7x7mm_P0.5mm.kicad_mod",
+      "library_id": "Package_QFP:LQFP-48_7x7mm_P0.5mm"
+    }
+  }
+}
+```
+
+Example `electrical_rules.json`:
+
+```json
+{
+  "pin_links": [
+    {"from_ref": "C1", "from_pad": "1", "to_ref": "U3", "to_pad": "22", "weight": 6.0}
+  ]
+}
+```
+
+These explicit links require the same real net on both numbered pads. The example pin numbers were found in the provided experimental board and **must not be treated as a universal STM32 recommendation**.
+
+```bash
+python -m harp_pcb input.kicad_pcb -o placed.kicad_pcb \
+  --footprint-replacements footprint_replacements.json \
+  --electrical-rules electrical_rules.json \
+  --stages-dir stages --snapshot-every 1000 --report report.json
+```
+
+The resulting report includes `footprint_resolution.applied/skipped`, `electrical_guidance.pin_aware_links`, `ambiguous_capacitors`, `original_pad_number_and_net_mapping_preserved` and an explicit `manufacturer_pin_function_validation_performed: false`. **Do not confuse these checks with an ERC/DRC, completed routing, or manufacturing certification.**
+
+Official sources for the narrowly scoped U3 option: [ST product page](https://www.st.com/en/microcontrollers-microprocessors/stm32f410cb.html) and [KiCad footprint libraries](https://www.kicad.org/libraries/download/).
 
 ## New: functional placement roles and antenna footprint spacing (v0.4)
 

@@ -28,6 +28,9 @@ import time
 from typing import Any
 
 from harp_ai import DEFAULT_BASE_URL, DEFAULT_MODEL, review_preflight
+from harp_electrical import infer_pin_guidance
+from harp_footprints import apply_replacements
+from harp_pinout import check_known_pinout
 
 try:
     import numpy as np
@@ -415,8 +418,8 @@ def infer_role(part: Part) -> tuple[str, str]:
     footprint = part.footprint
     if ANTENNA_RE.search(footprint) or ANTENNA_RE.search(value) or re.match(r'^(ANT|AE)\d+$',part.name,re.I):
         return 'antenna', 'footprint/value/reference-name heuristic'
-    if part.is_connector:
-        return 'io', 'connector/reference-name heuristic'
+    if part.is_connector or re.search(r'SBH11|IDC[-_ ]?Header|B2B[-_ ]?XH|Pin.?Header|Box.?Header', value, re.I):
+        return 'io', 'connector/reference/value heuristic'
     if PROCESSOR_RE.search(value):
         return 'processor', 'recognizable processor part number/value'
     if NOISE_RE.search(value):
@@ -1134,6 +1137,12 @@ def cli(argv=None):
     ap.add_argument('--direction-rules',type=Path,help='Explicit mechanical opening direction JSON')
     ap.add_argument('--placement-rules',type=Path,
                     help='JSON with optional component functional roles and hard antenna footprint spacings')
+    ap.add_argument('--electrical-rules',type=Path,
+                    help='Optional validated pin-to-pin guidance JSON; automatic hints need no file')
+    ap.add_argument('--footprint-replacements',type=Path,
+                    help='JSON mapping references to reviewed local .kicad_mod files or same-value donors')
+    ap.add_argument('--no-auto-reuse',action='store_true',
+                    help='Disable safe best-effort reuse of non-synthetic same-value board footprints')
     ap.add_argument('--allow-unverified-footprints',action='store_true',help='Legacy override for --strict-preflight, geometry experiments only')
     ap.add_argument('--allow-unresolved-orientation',action='store_true',help='Legacy override for --strict-preflight, NOT safe for production')
     ap.add_argument('--preflight-only',action='store_true',help='Write/list footprint and orientation issues without placement')
@@ -1156,11 +1165,33 @@ def cli(argv=None):
     if args.snapshot_every and not args.stages_dir:
         ap.error('--snapshot-every requires --stages-dir')
     source=args.input.read_text(encoding='utf-8')
+    original_source=source
+    fp_replacements=json.loads(args.footprint_replacements.read_text('utf-8')) if args.footprint_replacements else {}
+    pinout_audit=check_known_pinout(decode_parts(parse(original_source)),part_value)
+    blocked_refs={entry['ref'] for entry in pinout_audit if entry['conflicting_labels']}
+    if blocked_refs:
+        # A mismatched manufacturer-labelled pin cannot be silently fixed by
+        # changing only the copper land pattern. Keep its original geometry.
+        fp_replacements={**fp_replacements,'components':{
+            ref:spec for ref,spec in fp_replacements.get('components',{}).items()
+            if ref not in blocked_refs}}
+    if not args.verify:
+        source, footprint_resolution=apply_replacements(
+            source, fp_replacements,
+            base_dir=args.footprint_replacements.parent if args.footprint_replacements else args.input.parent,
+            auto_reuse=not args.no_auto_reuse,
+            parse=parse, span_children=span_children, footprint_audit=footprint_audit)
+    else:
+        footprint_resolution={'applied':[],'skipped':[],'manufacturing_verified':False}
     tree=parse(source)
     if tree[0]!='kicad_pcb':raise ValueError('Input is not a KiCad PCB file')
     ps=decode_parts(tree)
     rules_data=json.loads(args.direction_rules.read_text('utf-8')) if args.direction_rules else {}
     audit=apply_direction_rules(ps,rules_data)
+    audit['footprint_resolution']=footprint_resolution
+    audit['known_part_pinout_audit']=pinout_audit
+    audit['original_synthetic_footprints']=[x['ref'] for x in
+        footprint_audit(decode_parts(parse(original_source)))[0]]
     placement_data=json.loads(args.placement_rules.read_text('utf-8')) if args.placement_rules else {}
     guidance=apply_placement_guidance(ps,placement_data)
     audit['functional_placement']=guidance
@@ -1180,6 +1211,19 @@ def cli(argv=None):
     audit['review_required'] = review_needed
     audit['validation_mode'] = 'strict' if args.strict_preflight else 'best_effort'
     audit['nonblocking_warnings'] = []
+    if blocked_refs:
+        audit['nonblocking_warnings'].append(
+            'Manufacturer pin labels disagree with existing pad assignments for: '
+            + ', '.join(sorted(blocked_refs)) + '. Exact footprint substitutions were rejected; '
+            'repair the schematic/pin mapping before manufacturing.')
+    if footprint_resolution['applied']:
+        audit['nonblocking_warnings'].append(
+            'Guarded footprint geometries substituted; pad/net identities were preserved, '
+            'but datasheet pin functions, mechanical fit and physical library source '
+            'must still be reviewed before manufacturing.')
+    if footprint_resolution['skipped']:
+        audit['nonblocking_warnings'].append(
+            'Some footprint substitutions were rejected and their existing geometry was retained.')
     if audit['synthetic_footprints']:
         audit['nonblocking_warnings'].append(
             'Synthetic/placeholder footprints are NOT repaired or verified; geometry-only output. '
@@ -1227,6 +1271,10 @@ def cli(argv=None):
            for g in tree if isinstance(g,list) and g and g[0].startswith('gr_')):
         raise ValueError('Unsupported Edge.Cuts object detected')
     edges=make_edges(ps)
+    electrical_data=json.loads(args.electrical_rules.read_text('utf-8')) if args.electrical_rules else {}
+    pin_edges,pin_report=infer_pin_guidance(ps,edge_class=Edge,config=electrical_data)
+    edges.extend(pin_edges)
+    audit['electrical_guidance']=pin_report
     start=time.perf_counter()
     stages=[]
     if args.stages_dir:
@@ -1259,6 +1307,11 @@ def cli(argv=None):
     result['proxy_wirelength_weighted_mm']=round(result.pop('wire_proxy'),3)
     result['runtime_seconds']=round(time.perf_counter()-start,2)
     result['footprint_audit']=audit
+    result['footprint_resolution']=footprint_resolution
+    result['original_pad_number_and_net_mapping_preserved']=True
+    result['footprint_geometry_changed_from_input']=bool(footprint_resolution['applied'])
+    result['manufacturer_pin_function_validation_performed']=False
+    result['electrical_guidance']=pin_report
     result['functional_placement']=guidance
     result['role_soft_cost_final']=round(total_role_cost(ps,result['width'],result['height'],
                                                          result['origin_x'],result['origin_y']),3)
@@ -1276,7 +1329,10 @@ def cli(argv=None):
     result['manufacturing_ready']=False
     result['review_required_components']=sorted(set(
         r['ref'] for r in audit['synthetic_footprints']) | set(audit['unresolved_directions'])
-        | set(guidance['rf_review_needed']))
+        | set(guidance['rf_review_needed'])
+        | {x['ref'] for x in footprint_resolution['applied']}
+        | {x['ref'] for x in footprint_resolution['skipped']}
+        | blocked_refs )
     result['stages']=stages
     result['warning']='Unrouted placement only. KiCad DRC, actual part footprints, opening direction and manufacturing review are required.'
     args.output.parent.mkdir(parents=True,exist_ok=True)

@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "harp-pcb-placement"
-version = "0.4.0"
-description = "KiCad PCB placement with functional role priors, explicit RF footprint spacings, stages and best-effort preflight"
+version = "0.5.0"
+description = "KiCad PCB placement with guarded footprint substitution, pin-aware guidance, functional roles and staged validation"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24"]
@@ -22,10 +22,10 @@ dev = ["pytest>=8", "shapely>=2.0", "ruff>=0.8,<1", "build>=1.2"]
 harp-pcb = "harp_pcb:cli"
 
 [tool.hatch.build.targets.wheel]
-only-include = ["harp_pcb.py", "harp_ai.py"]
+only-include = ["harp_pcb.py", "harp_ai.py", "harp_footprints.py", "harp_electrical.py", "harp_pinout.py"]
 
 [tool.hatch.build.targets.sdist]
-include = ["harp_pcb.py", "harp_ai.py", "pyproject.toml", "README.md"]
+include = ["harp_pcb.py", "harp_ai.py", "harp_footprints.py", "harp_electrical.py", "harp_pinout.py", "pyproject.toml", "README.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

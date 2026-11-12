@@ -1,0 +1,5 @@
+{
+  "pin_links": [
+    {"from_ref": "C1", "from_pad": "1", "to_ref": "U3", "to_pad": "22", "weight": 6.0}
+  ]
+}
