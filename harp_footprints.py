@@ -31,16 +31,18 @@ def _child(node, key):
 
 
 def _ref(fp):
-    for p in fp:
-        if isinstance(p, list) and len(p) > 2 and p[0] == 'property' and p[1] == 'Reference':
-            return str(p[2])
+    for tag, key in (('property', 'Reference'), ('fp_text', 'reference')):
+        for p in fp:
+            if isinstance(p, list) and len(p) > 2 and p[0] == tag and str(p[1]).lower() == key.lower():
+                return str(p[2])
     return None
 
 
 def _value(fp):
-    for p in fp:
-        if isinstance(p, list) and len(p) > 2 and p[0] == 'property' and p[1] == 'Value':
-            return str(p[2]).strip()
+    for tag, key in (('property', 'Value'), ('fp_text', 'value')):
+        for p in fp:
+            if isinstance(p, list) and len(p) > 2 and p[0] == tag and str(p[1]).lower() == key.lower():
+                return str(p[2]).strip()
     return ''
 
 

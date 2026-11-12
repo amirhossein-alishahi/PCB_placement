@@ -1,4 +1,4 @@
-# HARP-PCB — KiCad auto-placement prototype (v0.5)
+# HARP-PCB — KiCad auto-placement prototype (v0.5.1)
 
 > **Geometric placement research tool, not a production board designer.**
 > The engine does **not** route traces, perform formal KiCad DRC, determine genuine footprints from part numbers, or guarantee that arbitrary mechanical/electrical requirements are met.
@@ -8,6 +8,16 @@ HARP-PCB reads an **unrouted** KiCad `.kicad_pcb` containing pads/net assignment
 **Supports:** rectilinear board auto-sizing; existing overlapping or nonzero starting coordinates; explicit connector/outward-face constraints and a limited `PCB Edge` marker heuristic; stage-by-stage KiCad and PNG snapshots; non-blocking synthetic footprint and ambiguous opening-direction warnings, optional AI preflight advice, and geometry validation after every saved snapshot.
 
 **Does not support generically:** non-rectangular/cutout-aware placement, full manufacturer-specific RF/copper keepouts, 3D mechanical access verification, locked mounting holes, previously routed tracks/vias, or copper zones. Some footprint shapes and both PCB sides may need a KiCad-level mechanical audit; bounding boxes are approximations. A complex outline is rejected unless explicitly replaced. Existing routes, vias or zones are rejected to avoid corrupting an existing design.
+
+## Cross-board validation (v0.5.1)
+
+A new cross-board regression suite tests 1–48 footprints, varied initial coordinates and rotations,
+oversized packages, TH and B.Cu components, missing courtyards, graphics-only footprints,
+and KiCad 6/7-style `fp_text` reference fields. See
+[VALIDATION_MATRIX.md](VALIDATION_MATRIX.md) for the full coverage and explicit exclusions.
+These are synthetic tests and do **not** prove compatibility with every KiCad PCB.
+Locked anchors and KiCad 4/5 `(module ...)` syntax are refused rather than
+silently changed or ignored. Resave older designs with modern KiCad first.
 
 ## Google Colab
 
