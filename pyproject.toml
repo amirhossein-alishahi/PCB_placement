@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "harp-pcb-placement"
-version = "0.5.0"
+version = "0.5.1"
 description = "KiCad PCB placement with guarded footprint substitution, pin-aware guidance, functional roles and staged validation"
 readme = "README.md"
 requires-python = ">=3.10"

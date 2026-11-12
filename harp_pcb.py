@@ -87,6 +87,27 @@ def get(node, name, default=None):
     return c[1] if c and len(c) > 1 else default
 
 
+def footprint_reference(fp):
+    """Support KiCad 8/9 property and KiCad 6/7 fp_text references."""
+    for item in children(fp, 'property'):
+        if len(item) > 2 and item[1] == 'Reference':
+            return str(item[2])
+    for item in children(fp, 'fp_text'):
+        if len(item) > 2 and str(item[1]).lower() == 'reference':
+            return str(item[2])
+    return None
+
+
+def footprint_value(fp):
+    for item in children(fp, 'property'):
+        if len(item) > 2 and item[1] == 'Value':
+            return str(item[2])
+    for item in children(fp, 'fp_text'):
+        if len(item) > 2 and str(item[1]).lower() == 'value':
+            return str(item[2])
+    return ''
+
+
 def fnum(value, default=0.0):
     try:
         return float(value)
@@ -409,8 +430,7 @@ NOISE_RE = re.compile(r'dc.?dc|dcdc|buck(?:.?converter)?|boost(?:.?converter)?|'
 
 
 def part_value(part: Part) -> str:
-    return next((str(prop[2]) for prop in children(part.node, 'property')
-                 if len(prop)>2 and prop[1]=='Value'), '')
+    return footprint_value(part.node)
 
 
 def infer_role(part: Part) -> tuple[str, str]:
@@ -581,11 +601,15 @@ def shape_bounds(node):
 
 
 def decode_parts(tree):
+    if children(tree, 'module'):
+        raise ValueError('KiCad 4/5 (module ...) footprints are unsupported. Resave the board with KiCad 9 before placement; no parts were moved.')
     parts=[]
     for fp in children(tree,'footprint'):
-        ref=next((str(p[2]) for p in children(fp,'property') if len(p)>2 and p[1]=='Reference'),None)
+        ref=footprint_reference(fp)
         if not ref:
-            raise ValueError('Footprint with no reference property')
+            raise ValueError('Footprint has no Reference (property or fp_text reference)')
+        if 'locked' in fp or child(fp, 'locked') is not None:
+            raise ValueError(f'{ref}: locked mechanical placement is not supported; refusing to move a locked footprint')
         pads=[]
         bounds=[]
         for p in children(fp,'pad'):
@@ -601,8 +625,6 @@ def decode_parts(tree):
             # Pad local angle is independent of footprint rotation.
             cs=[rot_xy(dx,dy,ang) for dx in (-w/2,w/2) for dy in (-h/2,h/2)]
             bounds.extend([(px+dx,py+dy) for dx,dy in cs])
-        if not pads:
-            raise ValueError(f'Footprint {ref} has no pads; needs explicit geometry handling')
         courtyard=[]
         for n in fp:
             if not isinstance(n,list) or not n or not n[0].startswith('fp_'):continue
@@ -611,6 +633,19 @@ def decode_parts(tree):
                 if b: courtyard.append(b)
         for x0,y0,x1,y1 in courtyard:
             bounds.extend([(x0,y0),(x1,y1)])
+        if not pads and not bounds:
+            # Padless logos and mechanical graphics are included only when their
+            # measurable Fab/Silk geometry provides a conservative envelope.
+            for primitive in fp:
+                if not isinstance(primitive,list) or not primitive or not primitive[0].startswith('fp_'):
+                    continue
+                if get(primitive, 'layer') in ('F.Fab','B.Fab','F.SilkS','B.SilkS'):
+                    bounds_rect=shape_bounds(primitive)
+                    if bounds_rect:
+                        x0,y0,x1,y1=bounds_rect
+                        bounds.extend([(x0,y0),(x1,y1)])
+            if not bounds:
+                raise ValueError(f'Footprint {ref} has no pads or measurable graphics/courtyard')
         # When courtyard missing, protect the pads plus a manufacturing proxy margin.
         m=0.15 if courtyard else 0.6
         minx,miny=min(p[0] for p in bounds)-m,min(p[1] for p in bounds)-m
@@ -933,7 +968,7 @@ def edit_board(original,parts,width,height,origin_x,origin_y):
             childsp=span_children(original,a,b)
             # Reference property extracted from a parsed copy, avoiding any string matching.
             fp_node=parse(original[a:b])
-            ref=next((str(c[2]) for c in children(fp_node,'property') if len(c)>2 and c[1]=='Reference'),None)
+            ref=footprint_reference(fp_node)
             if ref not in by_ref or ref in seen: raise ValueError('Footprint reference changed or duplicate')
             seen.add(ref)
             ats=[(aa,bb) for tg,aa,bb in childsp if tg=='at']
@@ -1083,7 +1118,7 @@ def verify(source_text, output_text,clearance=0.65,margin=2.0,direction_rules=No
     return {'footprints':len(ps),'nets':len(children(new,'net')),'pads':sum(len(p.pads) for p in ps),
             'board_width_mm':round(ex-ox,5),'board_height_mm':round(ey-oy,5),
             'board_area_mm2':round((ex-ox)*(ey-oy),2),
-            'min_bounding_box_gap_mm':round(min_gap,4),
+            'min_bounding_box_gap_mm':round(min_gap,4) if math.isfinite(min_gap) else None,
             'courtyard_missing':sorted(p.name for p in ps if not p.has_courtyard),
             'synthetic_footprints':sorted(p.name for p in ps if p.footprint.startswith('SYNTH_')),
             'pads_and_nets_unchanged':True,'perimeter_and_clearance_pass':True,
@@ -1160,7 +1195,7 @@ def cli(argv=None):
     ap.add_argument('--stages-dir',type=Path,help='Save verified intermediate KiCad PCB snapshots and previews')
     ap.add_argument('--snapshot-every',type=int,default=0,help='Write intermediate anneal snapshots every N iterations (requires --stages-dir)')
     args=ap.parse_args(argv)
-    if args.clearance<0 or args.edge_margin<0.5 or args.iterations<0 or args.snapshot_every<0:
+    if not math.isfinite(args.clearance) or not math.isfinite(args.edge_margin) or args.clearance<0 or args.edge_margin<0.5 or args.iterations<0 or args.snapshot_every<0:
         ap.error('Invalid clearance, margin, iterations or snapshot interval')
     if args.snapshot_every and not args.stages_dir:
         ap.error('--snapshot-every requires --stages-dir')
